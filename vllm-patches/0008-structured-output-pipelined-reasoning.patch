@@ -1,0 +1,386 @@
+Structured outputs under the batch queue: a grammar-constrained request makes the engine
+wait for the previous step's tokens only once its grammar applies, so a request that reasons
+before it answers (the app's memory extraction) keeps every decode step pipelined until its
+reasoning ends. While it reasons, the engine ships the grammar's initial bitmask row for
+every position flagged with the reasoning-end token id; the worker applies that row only at
+the position whose input token is the marker and ends the sampled window there, so the token
+after the marker is always grammar-constrained and the engine resumes its synchronous
+handshake from a consistent grammar state. Requests whose reasoning parser has no
+recognisable end token keep the stock synchronous scheduling.
+
+--- a/v1/core/sched/async_scheduler.py
++++ b/v1/core/sched/async_scheduler.py
+@@ -28,8 +28,19 @@
+             if request.is_prefill_chunk:
+                 continue
+ 
++            # The grammar needs the in-flight tokens only once it applies. While the
++            # request is still reasoning its steps stay pipelined: the worker holds
++            # the grammar's initial mask and applies it right after the reasoning-end
++            # marker (see StructuredOutputManager.grammar_bitmask), so nothing after
++            # the marker is ever sampled unconstrained.
+             scheduler_output.pending_structured_output_tokens |= (
+-                request.use_structured_output and request.num_output_placeholders > 0
++                request.use_structured_output
++                and request.num_output_placeholders > 0
++                and (
++                    self.structured_output_manager.should_fill_bitmask(request)
++                    or self.structured_output_manager.reasoning_end_token_id(request)
++                    is None
++                )
+             )
+             # The request will generate num_sampled_tokens_per_step new tokens
+             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
+--- a/v1/core/sched/output.py
++++ b/v1/core/sched/output.py
+@@ -316,3 +316,9 @@
+     structured_output_request_ids: list[str]
+     # Bitmask ordered as structured_output_request_ids.
+     grammar_bitmask: "npt.NDArray[np.int32]"
++    # Per request (same order): a token id when the request is still reasoning,
++    # else -1. The worker then applies the request's rows (all the grammar's
++    # initial mask) only at the position whose input token is that id — the
++    # position right after the reasoning-end marker — and ends the sampled
++    # window there. None when no request in the batch is conditional.
++    conditional_token_ids: list[int] | None = None
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -1792,12 +1792,14 @@
+         if not structured_output_request_ids:
+             return None
+ 
+-        bitmask = self.structured_output_manager.grammar_bitmask(
++        bitmask, conditional_token_ids = self.structured_output_manager.grammar_bitmask(
+             self.requests,
+             structured_output_request_ids,
+             scheduler_output.scheduled_spec_decode_tokens,
+         )
+-        return GrammarOutput(structured_output_request_ids, bitmask)
++        return GrammarOutput(
++            structured_output_request_ids, bitmask, conditional_token_ids
++        )
+ 
+     def update_from_output(
+         self,
+--- a/v1/structured_output/__init__.py
++++ b/v1/structured_output/__init__.py
+@@ -112,6 +112,29 @@
+             )
+         return structured_req.reasoner
+ 
++    def reasoning_end_token_id(self, request: "Request") -> int | None:
++        """Token id that ends the request's reasoning, if it can be told apart.
++
++        The worker needs it to constrain the token right after the marker while the
++        request's reasoning steps are pipelined; without it the request has to be
++        scheduled synchronously from admission.
++        """
++        reasoner = self._get_reasoner(request)
++        if reasoner is None:
++            return None
++        end_id = getattr(reasoner, "end_token_id", None)
++        if end_id is None:
++            engine = getattr(reasoner, "_parser_engine", None)
++            end_id = getattr(engine, "_reasoning_end_token_id", None)
++        return end_id
++
++    def _conditional_token_id(self, request: "Request") -> int:
++        """-1 unless the request is still reasoning and the transition can be guarded."""
++        if self.should_fill_bitmask(request):
++            return -1
++        end_id = self.reasoning_end_token_id(request)
++        return -1 if end_id is None else end_id
++
+     def grammar_init(self, request: "Request") -> None:
+         if request.structured_output_request is None:
+             return
+@@ -222,10 +245,14 @@
+         requests: dict[str, "Request"],
+         structured_output_request_ids: list[str],
+         scheduled_spec_decode_tokens: dict[str, list[int]],
+-    ) -> "npt.NDArray[np.int32] | None":
+-        # Prepare the structured output bitmask for this batch.
++    ) -> "tuple[npt.NDArray[np.int32] | None, list[int] | None]":
++        # Prepare the structured output bitmask for this batch. The second value
++        # lists, per request, the reasoning-end token id for requests still
++        # reasoning (their rows all hold the grammar's initial mask, applied by the
++        # worker only right after that token) and -1 otherwise.
+         if not structured_output_request_ids:
+-            return None
++            return None, None
++        conditional: list[int] = []
+ 
+         # Covers both speculative decoding and diffusion LLMs (canvas_length).
+         max_num_spec_tokens = self.vllm_config.num_speculative_tokens
+@@ -264,7 +291,9 @@
+                 if TYPE_CHECKING:
+                     assert isinstance(grammar, StructuredOutputGrammar)
+ 
+-                apply_bitmask = self.should_fill_bitmask(request)
++                cond = self._conditional_token_id(request)
++                conditional.append(cond)
++                apply_bitmask = self.should_fill_bitmask(request) or cond >= 0
+                 batch.append((grammar, cumulative_index, apply_bitmask))
+                 if len(batch) == self.fill_bitmask_parallel_batch_size:
+                     promises.append(self._async_submit_fill_bitmask(batch))
+@@ -289,6 +318,23 @@
+                 if TYPE_CHECKING:
+                     assert isinstance(grammar, StructuredOutputGrammar)
+                 apply_bitmask = self.should_fill_bitmask(request)
++                cond = self._conditional_token_id(request)
++                conditional.append(cond)
++                if cond >= 0:
++                    # Still reasoning: every position gets the grammar's initial mask
++                    # (the grammar has accepted nothing yet). The worker applies it
++                    # only at the position right after the reasoning-end marker and
++                    # ends the window there, so no in-window detection is needed.
++                    for _ in scheduled_spec_decode_tokens.get(req_id, ()):
++                        self._fill_bitmasks(((grammar, cumulative_index, True),))
++                        cumulative_index += 1
++                    if not (
++                        self.vllm_config.model_config.is_diffusion
++                        and scheduled_spec_decode_tokens.get(req_id)
++                    ):
++                        self._fill_bitmasks(((grammar, cumulative_index, True),))
++                        cumulative_index += 1
++                    continue
+ 
+                 reasoner = None if apply_bitmask else self._get_reasoner(request)
+                 detect_reasoning_end = reasoner is not None
+@@ -365,7 +411,9 @@
+         # After finishing with the xgrammar operations, we convert to
+         # np.ndarray, because that is much more efficient for serialization
+         # and deserialization when sending this to the GPU workers.
+-        return bitmask_tensor.numpy()
++        if all(c < 0 for c in conditional):
++            return bitmask_tensor.numpy(), None
++        return bitmask_tensor.numpy(), conditional
+ 
+     def should_fill_bitmask(self, request: "Request") -> bool:
+         # NOTE (Hanchen) if enable_in_reasoning is True, it means that
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -1428,6 +1428,7 @@
+                 input_batch,
+                 grammar_output.structured_output_request_ids,
+                 grammar_output.grammar_bitmask,
++                grammar_output.conditional_token_ids,
+             )
+ 
+         sampler_output: SamplerOutput | None
+@@ -1863,6 +1864,21 @@
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
++        if grammar_output is not None and grammar_output.conditional_token_ids:
++            # Requests still reasoning: end their windows at the reasoning-end
++            # marker so the token after it is always grammar-constrained.
++            assert self.batch_sharder is None, (
++                "conditional grammar masks are not supported with batch-sharded sampling"
++            )
++            assert self.structured_outputs_worker is not None
++            self.structured_outputs_worker.truncate_at_marker(
++                sampler_output.sampled_token_ids,
++                num_sampled,
++                num_rejected,
++                input_batch,
++                grammar_output.structured_output_request_ids,
++                grammar_output.conditional_token_ids,
++            )
+ 
+         if self.pp_handler is not None:
+             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+--- a/v1/worker/gpu/structured_outputs.py
++++ b/v1/worker/gpu/structured_outputs.py
+@@ -55,6 +55,14 @@
+         self.copy_stream = torch.cuda.Stream()
+         self.mask_stride = mask_stride
+         self.num_bonus_tokens = num_bonus_tokens
++        # Per mask row / per request: the token id a conditional mask waits for
++        # (the reasoning-end marker), -1 for an unconditional row or request.
++        self.cond_rows = torch.full(
++            (max_num_logits,), -1, dtype=torch.int32, device=device
++        )
++        self.cond_reqs = torch.full(
++            (max_num_logits,), -1, dtype=torch.int32, device=device
++        )
+ 
+     def apply_grammar_bitmask(
+         self,
+@@ -62,6 +70,7 @@
+         input_batch: InputBatch,
+         grammar_req_ids: list[str],
+         grammar_bitmask: np.ndarray,
++        conditional_token_ids: list[int] | None = None,
+     ) -> None:
+         if not grammar_req_ids:
+             return
+@@ -93,6 +102,22 @@
+             logits_indices = self.logits_indices[: len(mapping)].copy_(
+                 logits_indices, non_blocking=True
+             )
++            cond_rows = self.cond_rows[: len(mapping)]
++            if conditional_token_ids is None:
++                cond_rows.fill_(-1)
++            else:
++                cond_np = _expand_conditional(
++                    input_batch.req_ids,
++                    grammar_req_ids,
++                    conditional_token_ids,
++                    input_batch.cu_num_logits_np,
++                    input_batch.num_draft_tokens_per_req,
++                    self.num_bonus_tokens,
++                )
++                cond_cpu = torch.tensor(
++                    cond_np.tolist(), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
++                )
++                cond_rows.copy_(cond_cpu, non_blocking=True)
+ 
+         # Ensure all async copies are complete before launching the kernel.
+         current_stream = torch.cuda.current_stream()
+@@ -111,6 +136,9 @@
+             bitmask,
+             bitmask.stride(0),
+             vocab_size,
++            cond_rows,
++            input_batch.input_ids,
++            input_batch.logits_indices,
+             MASK_STRIDE=self.mask_stride,
+             BLOCK_SIZE=BLOCK_SIZE,
+         )
+@@ -119,6 +147,110 @@
+         # before it re-uses or deallocates them
+         self.copy_stream.wait_stream(current_stream)
+ 
++    def truncate_at_marker(
++        self,
++        sampled_token_ids: torch.Tensor,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++        input_batch: InputBatch,
++        grammar_req_ids: list[str],
++        conditional_token_ids: list[int],
++    ) -> None:
++        """End each conditional request's window at its reasoning-end marker.
++
++        A window whose first input is the marker keeps exactly one token (the one
++        the initial mask constrained); a window that sampled the marker later keeps
++        the tokens up to and including it. Everything after is reported as rejected,
++        so the next window starts right after the marker or the constrained token.
++        """
++        num_reqs = input_batch.num_reqs
++        cond_np = np.full(num_reqs, -1, dtype=np.int32)
++        req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
++        for req_id, cond in zip(grammar_req_ids, conditional_token_ids):
++            if cond >= 0:
++                cond_np[req_id_to_idx[req_id]] = cond
++        with torch.cuda.stream(self.copy_stream):
++            cond_cpu = torch.tensor(
++                cond_np.tolist(), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
++            )
++            cond_reqs = self.cond_reqs[:num_reqs].copy_(cond_cpu, non_blocking=True)
++        current_stream = torch.cuda.current_stream()
++        current_stream.wait_stream(self.copy_stream)
++        _truncate_at_marker_kernel[(num_reqs,)](
++            sampled_token_ids,
++            sampled_token_ids.stride(0),
++            sampled_token_ids.shape[1],
++            num_sampled,
++            num_rejected,
++            input_batch.cu_num_logits,
++            input_batch.logits_indices,
++            input_batch.input_ids,
++            cond_reqs,
++            num_warps=1,
++        )
++        self.copy_stream.wait_stream(current_stream)
++
++
++def _expand_conditional(
++    req_ids: list[str],
++    grammar_req_ids: list[str],
++    conditional_token_ids: list[int],
++    cu_num_logits_np: np.ndarray,
++    num_draft_tokens_per_req: np.ndarray | None,
++    num_bonus_tokens: int,
++) -> np.ndarray:
++    """One conditional token id per mask row, in the mapping's order."""
++    values: list[int] = []
++    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
++    for grammar_req_id, cond in zip(grammar_req_ids, conditional_token_ids):
++        req_idx = req_id_to_idx[grammar_req_id]
++        if num_draft_tokens_per_req is None:
++            num_positions = int(
++                cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]
++            )
++        else:
++            num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
++        values.extend([cond] * num_positions)
++    return np.asarray(values, dtype=np.int32)
++
++
++@triton.jit
++def _truncate_at_marker_kernel(
++    sampled_ptr,
++    sampled_stride,
++    max_sampled,
++    num_sampled_ptr,
++    num_rejected_ptr,
++    cu_num_logits_ptr,
++    logits_indices_ptr,
++    input_ids_ptr,
++    cond_ptr,
++):
++    req_idx = tl.program_id(0)
++    cond = tl.load(cond_ptr + req_idx)
++    if cond < 0:
++        return
++    start = tl.load(cu_num_logits_ptr + req_idx)
++    num_positions = tl.load(cu_num_logits_ptr + req_idx + 1) - start
++    marker_pos = -1
++    for k in range(num_positions):
++        token = tl.load(input_ids_ptr + tl.load(logits_indices_ptr + start + k))
++        marker_pos = tl.where((marker_pos < 0) & (token == cond), k, marker_pos)
++    if marker_pos < 0:
++        return
++    # Keep the tokens before the marker's position, or just the constrained token
++    # when the marker is the window's first input.
++    keep = tl.maximum(marker_pos, 1)
++    for k in range(keep, max_sampled):
++        tl.store(sampled_ptr + req_idx * sampled_stride + k, -1)
++    num_sampled = tl.load(num_sampled_ptr + req_idx)
++    new_num_sampled = tl.minimum(num_sampled, keep)
++    tl.store(num_sampled_ptr + req_idx, new_num_sampled)
++    tl.store(
++        num_rejected_ptr + req_idx,
++        tl.load(num_rejected_ptr + req_idx) + (num_sampled - new_num_sampled),
++    )
++
+ 
+ # Adapted from
+ # https://github.com/mlc-ai/xgrammar/blob/main/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py
+@@ -131,6 +263,9 @@
+     bitmask_ptr,
+     bitmask_stride,
+     vocab_size,
++    cond_ptr,
++    input_ids_ptr,
++    input_logits_indices_ptr,
+     MASK_STRIDE: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+@@ -142,6 +277,14 @@
+     num_req_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - logits_idx
+     logits_idx += position_idx
+     position_is_active = position_idx < num_req_logits
++    # A conditional row applies only where the position's input token is the
++    # token it waits for (the reasoning-end marker).
++    cond = tl.load(cond_ptr + bitmask_idx)
++    input_pos = tl.load(
++        input_logits_indices_ptr + logits_idx, mask=position_is_active, other=0
++    )
++    input_token = tl.load(input_ids_ptr + input_pos, mask=position_is_active, other=-1)
++    position_is_active = position_is_active & ((cond < 0) | (input_token == cond))
+ 
+     # Load the bitmask.
+     block_id = tl.program_id(1)

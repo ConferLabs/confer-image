@@ -20,10 +20,11 @@
 #   VLLM_MODEL_RUNNER           v2 (default) | v1 (the pre-0.29 GPU model runner)
 #   VLLM_CUDA_LAUNCH_BLOCKING   0 (default) | 1 serialises kernel launches so a device-side
 #                               assert names the faulting kernel; slow, diagnosis only
-#   VLLM_CC_MULTISTEP           0 (default) | 2..8 = number of decode steps kept in flight with a
-#                               deferred token readback (Model Runner V2 only; see the vLLM source
-#                               overrides). Depths 2 to 4 measure the same under TP8; 3 is the
-#                               reference configuration.
+#   VLLM_CC_MULTISTEP           0 (default) | 2 = keep two decode steps in flight with a deferred
+#                               token readback (Model Runner V2 only; see the vLLM source patches).
+#                               Only 2 is allowed: the engine's structured-output handling assumes at
+#                               most one batch in flight ahead of a grammar-constrained request, and
+#                               a deeper queue makes JSON-mode requests fail with grammar rejections.
 
 set -u
 
@@ -32,7 +33,7 @@ is_true() { [[ "${1:-0}" =~ ^(1|true|yes)$ ]]; }
 case "${VLLM_GDN_DECODE_KERNEL:-cuda}" in cuda|triton) ;; *) echo "confer-vllm: VLLM_GDN_DECODE_KERNEL must be cuda or triton" >&2; exit 64 ;; esac
 case "${VLLM_MODEL_RUNNER:-v2}" in v1|v2) ;; *) echo "confer-vllm: VLLM_MODEL_RUNNER must be v1 or v2" >&2; exit 64 ;; esac
 case "${VLLM_CUDA_LAUNCH_BLOCKING:-0}" in 0|1) ;; *) echo "confer-vllm: VLLM_CUDA_LAUNCH_BLOCKING must be 0 or 1" >&2; exit 64 ;; esac
-case "${VLLM_CC_MULTISTEP:-0}" in 0|[2-8]) ;; *) echo "confer-vllm: VLLM_CC_MULTISTEP must be 0 or a step count from 2 to 8" >&2; exit 64 ;; esac
+case "${VLLM_CC_MULTISTEP:-0}" in 0|2) ;; *) echo "confer-vllm: VLLM_CC_MULTISTEP must be 0 or 2" >&2; exit 64 ;; esac
 args=(
   --model "$VLLM_MODEL"
   --served-model-name "$VLLM_SERVED_MODEL_NAME"

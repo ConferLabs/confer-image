@@ -58,7 +58,4 @@ sha256, so a vLLM upgrade that touches one of them fails the build rather than s
 the change (`make check-vllm-patches` re-verifies the set against the wheel on PyPI). They exist
 because confidential-computing guests cannot serve GPU reads of pinned host memory in place and
 turn every host-device copy into a blocking call, which breaks and then serialises vLLM's V2
-model runner. `VLLM_CC_MULTISTEP=<steps>` in `secrets.env` enables the
-multi-step mode those overrides add: that many decode steps kept in flight with a deferred token
-readback that the tensor-parallel workers hold back until the engine needs it (0 disables it). FlashAttention 3 is the attention backend: the FlashInfer backend cannot use full CUDA graphs
-during speculative decoding.
+model runner. 
