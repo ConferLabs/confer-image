@@ -1,0 +1,19 @@
+# /etc/fstab: static filesystem table for Confer TDX VM
+#
+# <filesystem>  <mount-point>  <type>  <options>  <dump>  <pass>
+
+# Tmpfs for /tmp (required for read-only rootfs)
+tmpfs  /tmp  tmpfs  mode=1777,strictatime,nosuid,nodev,size=50%  0 0
+
+# Tmpfs for /var/log (required for read-only rootfs)
+# Services like nvidia-fabricmanager write logs here
+tmpfs  /var/log  tmpfs  mode=0755,strictatime,nosuid,nodev,size=1G  0 0
+
+# Secondary virtio-blk disk for model weights (read-only)
+/dev/vdb  /mnt/models  ext4  ro,noatime,nofail  0 0
+
+# Secondary virtio-blk disk for configuration and secrets (read-only)
+/dev/vdc  /mnt/config  ext4  ro,noatime,nofail  0 0
+
+# Proxy disk containing proxy.zip (read-only)
+/dev/vdd  /mnt/proxy  ext4  ro,noatime,nofail  0 0

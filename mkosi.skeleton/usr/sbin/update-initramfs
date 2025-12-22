@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stub to prevent update-initramfs from running during mkosi build
+# mkosi builds its own initrd via mkosi.images/initrd
+echo "update-initramfs: skipped during mkosi build"
+exit 0

@@ -1,0 +1,93 @@
+name: Release Image
+
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (without v prefix)'
+        required: true
+        default: '0.1.0'
+
+env:
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
+jobs:
+  build:
+    runs-on:
+      group: Default
+      labels: [confer-large]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify version matches mkosi.conf
+        run: |
+          MKOSI_VERSION=$(grep '^ImageVersion=' mkosi.conf | cut -d= -f2)
+          INPUT_VERSION=${{ steps.version.outputs.version }}
+
+          echo "mkosi.conf ImageVersion: $MKOSI_VERSION"
+          echo "Tag/input version: $INPUT_VERSION"
+
+          if [ "$MKOSI_VERSION" != "$INPUT_VERSION" ]; then
+            echo ""
+            echo "ERROR: Version mismatch!"
+            echo "mkosi.conf has ImageVersion=$MKOSI_VERSION but tag/input is $INPUT_VERSION"
+            echo ""
+            echo "Update mkosi.conf to match, or use the correct version."
+            exit 1
+          fi
+
+          echo "Version verified."
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y debian-archive-keyring mtools dosfstools qemu-utils
+
+      - name: Configure unprivileged user namespaces
+        run: |
+          # AppArmor restriction (Ubuntu 24.04+)
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+          # Classic sysctl (older kernels)
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone
+          fi
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build image
+        run: |
+          nix develop --command make build IMAGE_VERSION=${{ steps.version.outputs.version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Upload artifacts to S3
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          aws s3 cp confer-image_${VERSION}.vmlinuz s3://${S3_BUCKET}/images/${VERSION}/vmlinuz
+          aws s3 cp confer-image_${VERSION}.initrd s3://${S3_BUCKET}/images/${VERSION}/initrd
+          aws s3 cp confer-image_${VERSION}.qcow2 s3://${S3_BUCKET}/images/${VERSION}/rootfs.qcow2
+          aws s3 cp confer-image_${VERSION}.cmdline s3://${S3_BUCKET}/images/${VERSION}/cmdline

@@ -1,0 +1,14 @@
+[Unit]
+Description=Confer Boot - Verify and Extract Proxy
+DefaultDependencies=no
+After=local-fs.target mnt-proxy.mount
+Requires=mnt-proxy.mount
+Before=confer-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/confer-boot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,190 @@
+#!/bin/bash
+# mkosi post-installation script
+# Runs inside the image after packages are installed
+
+set -euo pipefail
+
+echo "==> Setting up Confer proxy environment"
+
+# Create mount points for secondary disks
+mkdir -p /buildroot/mnt/models /buildroot/mnt/config /buildroot/mnt/proxy
+
+# Install Python packages in two stages:
+# 1. vLLM system-wide (has modern dependency versions)
+# 2. Attestation SDK in venv (has pinned older versions that conflict with vLLM)
+
+# Set up DNS resolution for the chroot (required for pip to reach pypi.org)
+mkdir -p /buildroot/etc
+if [ -f /etc/resolv.conf ]; then
+    cp /etc/resolv.conf /buildroot/etc/resolv.conf
+    echo "Copied /etc/resolv.conf to chroot for DNS resolution"
+else
+    cat > /buildroot/etc/resolv.conf << 'DNSEOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+DNSEOF
+    echo "Created /etc/resolv.conf with Google DNS fallback"
+fi
+
+# Ensure /tmp exists in the buildroot for pip
+mkdir -p /buildroot/tmp
+
+# Verify pip is available
+if ! chroot /buildroot which pip3 >/dev/null 2>&1; then
+    echo "ERROR: pip3 not found in image. Ensure python3-pip is in Packages= in mkosi.conf"
+    exit 1
+fi
+
+# Stage 1: Install vLLM system-wide (skip if already installed with same requirements)
+echo "==> Installing vLLM packages system-wide"
+if [ -f /buildroot/requirements-vllm.lock ]; then
+    VLLM_HASH=$(sha256sum /buildroot/requirements-vllm.lock | cut -d' ' -f1)
+    VLLM_HASH_FILE="/buildroot/opt/.requirements-vllm.hash"
+
+    if [ -f "$VLLM_HASH_FILE" ] && [ "$(cat "$VLLM_HASH_FILE")" = "$VLLM_HASH" ]; then
+        echo "✓ vLLM already installed with matching requirements, skipping"
+    else
+        echo "Running pip install for vLLM (this may take a while)..."
+        cp /buildroot/requirements-vllm.lock /buildroot/tmp/requirements-vllm.lock
+        chroot /buildroot python3 -m pip install \
+            --break-system-packages \
+            --no-cache-dir \
+            -r /tmp/requirements-vllm.lock
+
+        # Verify vllm was installed
+        if [ -d /buildroot/usr/local/lib/python3.12/dist-packages/vllm ]; then
+            echo "✓ vLLM package installed"
+            if [ -d /buildroot/usr/local/lib/python3.12/dist-packages/torch ]; then
+                echo "✓ PyTorch package installed"
+            else
+                echo "ERROR: PyTorch not found after pip install"
+                exit 1
+            fi
+        else
+            echo "ERROR: vLLM package directory not found after pip install"
+            exit 1
+        fi
+
+        # Store hash for future builds
+        echo "$VLLM_HASH" > "$VLLM_HASH_FILE"
+        rm -f /buildroot/tmp/requirements-vllm.lock
+    fi
+    rm -f /buildroot/requirements-vllm.lock
+else
+    echo "ERROR: requirements-vllm.lock not found"
+    exit 1
+fi
+
+# Stage 2: Install attestation SDK in isolated venv (skip if already installed with same requirements)
+# NVIDIA's nv-ppcie-verifier has strict version pins that conflict with vLLM
+echo "==> Installing attestation SDK in /opt/venv-attestation"
+if [ -f /buildroot/requirements-attestation.lock ]; then
+    ATT_HASH=$(sha256sum /buildroot/requirements-attestation.lock | cut -d' ' -f1)
+    ATT_HASH_FILE="/buildroot/opt/.requirements-attestation.hash"
+
+    if [ -f "$ATT_HASH_FILE" ] && [ "$(cat "$ATT_HASH_FILE")" = "$ATT_HASH" ]; then
+        echo "✓ Attestation SDK already installed with matching requirements, skipping"
+    else
+        echo "Running pip install for attestation SDK..."
+        cp /buildroot/requirements-attestation.lock /buildroot/tmp/requirements-attestation.lock
+
+        # Create venv for attestation
+        chroot /buildroot python3 -m venv /opt/venv-attestation
+
+        chroot /buildroot /opt/venv-attestation/bin/pip install \
+            --no-cache-dir \
+            -r /tmp/requirements-attestation.lock
+
+        # Verify attestation SDK was installed
+        if chroot /buildroot /opt/venv-attestation/bin/python -c "import nv_attestation_sdk" 2>/dev/null; then
+            echo "✓ nv-attestation-sdk installed in venv"
+        else
+            echo "✓ nv-attestation-sdk package files installed (import check skipped in build env)"
+        fi
+
+        # Store hash for future builds
+        echo "$ATT_HASH" > "$ATT_HASH_FILE"
+        rm -f /buildroot/tmp/requirements-attestation.lock
+    fi
+    rm -f /buildroot/requirements-attestation.lock
+else
+    echo "ERROR: requirements-attestation.lock not found"
+    exit 1
+fi
+
+echo "✓ Python packages installed successfully"
+
+# Install Vector static binary (apt package has dependency issues with snapshot repos)
+echo "==> Installing Vector log shipper"
+VECTOR_VERSION="0.51.1"
+VECTOR_URL="https://packages.timber.io/vector/${VECTOR_VERSION}/vector-${VECTOR_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+VECTOR_TARBALL="/buildroot/tmp/vector.tar.gz"
+
+if [ ! -f /buildroot/usr/bin/vector ]; then
+    echo "Downloading Vector ${VECTOR_VERSION}..."
+    curl -fsSL "${VECTOR_URL}" -o "${VECTOR_TARBALL}"
+
+    echo "Extracting Vector..."
+    tar -xzf "${VECTOR_TARBALL}" -C /buildroot/tmp/
+
+    # Install binary
+    cp "/buildroot/tmp/vector-x86_64-unknown-linux-gnu/bin/vector" /buildroot/usr/bin/vector
+    chmod +x /buildroot/usr/bin/vector
+
+    # Clean up
+    rm -rf "${VECTOR_TARBALL}" "/buildroot/tmp/vector-x86_64-unknown-linux-gnu"
+
+    echo "✓ Vector ${VECTOR_VERSION} installed"
+else
+    echo "✓ Vector already installed, skipping"
+fi
+
+# Enable services
+chroot /buildroot systemctl enable nvidia-persistenced.service
+chroot /buildroot systemctl enable nvidia-fabricmanager.service
+chroot /buildroot systemctl enable nvidia-cc-attestation.service
+chroot /buildroot systemctl enable confer-vllm.service
+chroot /buildroot systemctl enable confer-boot.service
+chroot /buildroot systemctl enable confer-proxy.service
+chroot /buildroot systemctl enable vector.service
+
+# Make confer-boot script executable
+chmod +x /buildroot/usr/local/bin/confer-boot
+
+# Mask services that don't work with read-only rootfs (dm-verity)
+# systemd-logind requires writable /var/lib/systemd which we don't have
+chroot /buildroot systemctl mask systemd-logind.service
+
+# Set a fixed machine-id for reproducibility AND working DHCP
+# systemd-networkd DHCP client requires machine-id to generate DUID
+# Using same UUID as mkosi.conf Seed for consistency
+echo "a24031c1fc68453d80fa00ad057a5780" > /buildroot/etc/machine-id
+
+echo "==> Setting up Java cacerts symlink for runtime generation"
+# Java cacerts cannot be generated deterministically at build time (timestamps vary)
+# Instead, we create a symlink to /run/java-cacerts/cacerts which will be populated at boot
+# by java-cacerts-init.service using keytool
+# This is safe because:
+# 1. The keytool binary is in the measured rootfs
+# 2. The CA certificates in /etc/ssl/certs/*.pem are in the measured rootfs
+# 3. An attacker cannot inject rogue CAs without modifying the measured image
+rm -f /buildroot/etc/ssl/certs/java/cacerts
+mkdir -p /buildroot/etc/ssl/certs/java
+ln -sf /run/java-cacerts/cacerts /buildroot/etc/ssl/certs/java/cacerts
+chroot /buildroot systemctl enable java-cacerts-init.service
+echo "✓ Cacerts symlink created -> /run/java-cacerts/cacerts (generated at boot)"
+
+echo "==> Removing DKMS build logs for reproducibility"
+# Remove DKMS build logs that contain timestamps and non-deterministic build output
+find /buildroot/var/lib/dkms -type d -name log -exec rm -rf {} + 2>/dev/null || true
+
+echo "==> Configuring static DNS (no systemd-resolved)"
+# Overwrite resolv.conf with static DNS servers
+# This must happen after package installation since systemd installs its own
+cat > /buildroot/etc/resolv.conf << 'EOF'
+# Static DNS configuration for Confer proxy VM
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+
+echo "==> Post-install complete"

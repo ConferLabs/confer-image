@@ -1,0 +1,22 @@
+#!/bin/bash
+# mkosi finalize script
+# Runs on HOST after postinst
+
+set -euo pipefail
+
+echo "==> Finalize: Cleanup"
+
+# BUILDROOT is set by mkosi - it's the path to the image root
+if [ -z "${BUILDROOT:-}" ]; then
+    echo "ERROR: BUILDROOT not set - this script must be run by mkosi"
+    exit 1
+fi
+
+# Clean up any pip cache (may be in /root/.cache or /.cache depending on how pip was invoked)
+rm -rf "$BUILDROOT/root/.cache/pip" 2>/dev/null || true
+rm -rf "$BUILDROOT/.cache/pip" 2>/dev/null || true
+
+# Ensure /tmp is empty for tmpfs mount at boot
+rm -rf "$BUILDROOT/tmp"/* 2>/dev/null || true
+
+echo "==> Finalize complete"

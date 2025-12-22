@@ -1,0 +1,14 @@
+# Ubuntu Noble (24.04 LTS) snapshot for reproducible builds
+# NVIDIA driver packages come from CUDA repo (pinned versions), not Ubuntu repos
+# Ubuntu repos are only used for non-NVIDIA system packages
+# This file overrides mkosi's default repository configuration to ensure
+# ALL packages come from the snapshot service, not live repos
+
+# Main repository
+deb http://snapshot.ubuntu.com/ubuntu/20251201T000000Z/ noble main restricted universe multiverse
+
+# Updates repository (from snapshot, not live updates)
+deb http://snapshot.ubuntu.com/ubuntu/20251201T000000Z/ noble-updates main restricted universe multiverse
+
+# Security repository (from snapshot, not live security updates)
+deb http://snapshot.ubuntu.com/ubuntu/20251201T000000Z/ noble-security main restricted universe multiverse

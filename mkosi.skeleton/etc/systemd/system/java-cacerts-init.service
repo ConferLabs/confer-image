@@ -1,0 +1,18 @@
+[Unit]
+Description=Generate Java CA certificates keystore
+DefaultDependencies=no
+Before=confer-proxy.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=java-cacerts
+# Generate cacerts keystore from system CA certificates using keytool
+# The source certs in /etc/ssl/certs are in the measured dm-verity rootfs
+# The symlink at /etc/ssl/certs/java/cacerts points to /run/java-cacerts/cacerts
+# Password "changeit" is the standard Java truststore default
+ExecStart=/bin/bash -c 'for cert in /etc/ssl/certs/*.pem; do keytool -import -noprompt -trustcacerts -alias "$(basename "$cert" .pem)" -file "$cert" -keystore /run/java-cacerts/cacerts -storepass changeit 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target

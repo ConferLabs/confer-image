@@ -1,0 +1,13 @@
+#!/bin/bash
+# mkosi build script (chroot version)
+# Runs inside a chroot with BuildPackages available in overlay
+#
+# NOTE: Changes made here do NOT persist to the final image!
+# Build scripts run in a temporary overlay for compiling/building.
+# For installing packages into the final image, use mkosi.postinst instead.
+
+set -euo pipefail
+
+echo "==> Build (chroot): No build steps needed"
+echo "    Python packages are installed in mkosi.postinst (which persists to final image)"
+echo "==> Build complete"

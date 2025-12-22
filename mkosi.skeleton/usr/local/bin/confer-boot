@@ -1,0 +1,95 @@
+#!/bin/bash
+# Confer Boot Script
+# Verifies and extracts the Java proxy from the proxy disk.
+# The expected hash is passed via kernel cmdline as proxy-hash=sha256:<hash>
+# The proxy disk is mounted at /mnt/proxy via fstab
+
+set -euo pipefail
+
+PROXY_MOUNT="/mnt/proxy"
+PROXY_DIR="/run/confer"
+PROXY_ZIP="${PROXY_DIR}/proxy.zip"
+PROXY_JAR="${PROXY_DIR}/proxy.jar"
+MANIFEST_JSON="${PROXY_DIR}/manifest.json"
+MANIFEST_BUNDLE="${PROXY_DIR}/manifest.bundle.json"
+
+log() {
+    echo "[confer-boot] $*"
+}
+
+error() {
+    echo "[confer-boot] ERROR: $*" >&2
+    exit 1
+}
+
+# Extract parameter from kernel cmdline
+get_cmdline_param() {
+    local param="$1"
+    cat /proc/cmdline | tr ' ' '\n' | grep "^${param}=" | cut -d= -f2-
+}
+
+# Main
+log "Starting Confer boot process..."
+
+# Get expected proxy hash from kernel cmdline
+EXPECTED_HASH=$(get_cmdline_param "proxy-hash")
+
+if [ -z "$EXPECTED_HASH" ]; then
+    error "proxy-hash not found in kernel cmdline"
+fi
+
+log "Expected proxy hash: $EXPECTED_HASH"
+
+# Check proxy.zip exists on mounted disk
+if [ ! -f "$PROXY_MOUNT/proxy.zip" ]; then
+    error "proxy.zip not found at $PROXY_MOUNT/proxy.zip"
+fi
+
+# Create runtime directory
+mkdir -p "$PROXY_DIR"
+
+# Copy proxy zip from mounted disk to ramdisk
+log "Copying proxy from disk to ramdisk..."
+cp "$PROXY_MOUNT/proxy.zip" "$PROXY_ZIP"
+
+# Verify hash
+log "Verifying proxy hash..."
+ACTUAL_HASH="sha256:$(sha256sum "$PROXY_ZIP" | cut -d' ' -f1)"
+
+if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+    rm -f "$PROXY_ZIP"
+    error "Hash mismatch! Expected: $EXPECTED_HASH, Got: $ACTUAL_HASH"
+fi
+
+log "Hash verified successfully"
+
+# Extract proxy
+log "Extracting proxy..."
+cd "$PROXY_DIR"
+unzip -q "$PROXY_ZIP"
+rm -f "$PROXY_ZIP"  # Free up ramdisk space
+
+# Verify proxy.jar exists
+if [ ! -f "$PROXY_JAR" ]; then
+    error "proxy.jar not found in archive"
+fi
+
+log "Proxy ready at $PROXY_JAR"
+
+# Copy manifest files from proxy disk
+log "Copying manifest files..."
+if [ -f "$PROXY_MOUNT/manifest.json" ]; then
+    cp "$PROXY_MOUNT/manifest.json" "$MANIFEST_JSON"
+    log "Copied manifest.json"
+else
+    error "manifest.json not found at $PROXY_MOUNT/manifest.json"
+fi
+
+if [ -f "$PROXY_MOUNT/manifest.bundle.json" ]; then
+    cp "$PROXY_MOUNT/manifest.bundle.json" "$MANIFEST_BUNDLE"
+    log "Copied manifest.bundle.json"
+else
+    error "manifest.bundle.json not found at $PROXY_MOUNT/manifest.bundle.json"
+fi
+
+log "Confer boot complete"

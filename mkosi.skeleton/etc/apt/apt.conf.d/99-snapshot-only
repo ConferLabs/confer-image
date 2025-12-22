@@ -1,0 +1,9 @@
+// Force apt to use only the snapshot repository
+// Prevent any automatic repository additions or updates
+
+// Disable automatic repository updates
+APT::Get::Update::SourceListWarnings::NonFreeFirmware "false";
+
+// Acquire settings for reproducible builds
+Acquire::Check-Valid-Until "false";  // Ignore expired Release files from snapshot
+Acquire::Max-ValidTime "0";          // Don't validate timestamp freshness

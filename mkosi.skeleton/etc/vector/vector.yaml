@@ -1,0 +1,71 @@
+data_dir: /run/vector
+
+# =============================================================================
+# SOURCES
+# =============================================================================
+
+sources:
+  journald:
+    type: journald
+    current_boot_only: true
+    exclude_units:
+      - vector.service
+
+  vllm_metrics:
+    type: prometheus_scrape
+    endpoints:
+      - "http://localhost:${VLLM_PORT}/metrics"
+    scrape_interval_secs: 15
+
+  proxy_metrics:
+    type: prometheus_scrape
+    endpoints:
+      - "http://localhost:9090/observe/metrics"
+    scrape_interval_secs: 15
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+
+transforms:
+  add_instance_label:
+    type: remap
+    inputs:
+      - vllm_metrics
+      - proxy_metrics
+    source: |
+      .tags.instance = get_env_var!("INSTANCE_ID")
+
+  add_instance_to_logs:
+    type: remap
+    inputs:
+      - journald
+    source: |
+      .instance = get_env_var!("INSTANCE_ID")
+
+# =============================================================================
+# SINKS
+# =============================================================================
+
+sinks:
+  logging_logs:
+    type: http
+    inputs:
+      - add_instance_to_logs
+    uri: "${LOGGING_INGEST_URL}"
+    method: post
+    encoding:
+      codec: json
+    request:
+      headers:
+        Authorization: "Bearer ${LOGGING_SOURCE_TOKEN}"
+        Content-Type: application/json
+
+  logging_metrics:
+    type: prometheus_remote_write
+    inputs:
+      - add_instance_label
+    endpoint: "${LOGGING_METRICS_URL}"
+    auth:
+      strategy: bearer
+      token: "${LOGGING_SOURCE_TOKEN}"

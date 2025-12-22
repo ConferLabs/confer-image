@@ -1,0 +1,19 @@
+work/
+output/
+mkosi.output/
+mkosi.cache/
+*.qcow2
+*.raw
+*.img
+*.efi
+*.vmlinuz
+*.initrd
+*.cmdline
+.skeleton-hash
+.esp-mount/
+
+# Logs
+*.log
+
+doc/
+/bin/

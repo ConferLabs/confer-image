@@ -1,0 +1,17 @@
+[Unit]
+Description=Vector Log and Metrics Shipper
+Documentation=https://vector.dev
+After=network-online.target mnt-config.mount
+Wants=network-online.target
+Requires=mnt-config.mount
+
+[Service]
+Type=simple
+EnvironmentFile=/mnt/config/secrets.env
+ExecStartPre=/bin/mkdir -p /run/vector
+ExecStart=/usr/bin/vector --config /etc/vector/vector.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

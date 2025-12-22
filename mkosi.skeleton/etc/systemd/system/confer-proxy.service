@@ -1,0 +1,26 @@
+[Unit]
+Description=Confer Proxy Service
+After=network-online.target mnt-config.mount confer-vllm.service java-cacerts-init.service confer-boot.service
+Wants=network-online.target
+Requires=mnt-config.mount java-cacerts-init.service confer-boot.service
+Wants=confer-vllm.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/run/confer
+EnvironmentFile=/mnt/config/secrets.env
+ExecStart=/usr/bin/java -Dfile.encoding=UTF-8 \
+    -Xms${JAVA_HEAP_MIN} \
+    -Xmx${JAVA_HEAP_MAX} \
+    -Djavax.net.ssl.trustStore=/run/java-cacerts/cacerts \
+    -Djavax.net.ssl.trustStorePassword=changeit \
+    -Djavax.net.ssl.trustStoreType=PKCS12 \
+    -DLOGGING_SOURCE_TOKEN=${LOGGING_SOURCE_TOKEN} \
+    -DLOGGING_INGEST_URL=${LOGGING_INGEST_URL} \
+    -jar /run/confer/proxy.jar
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

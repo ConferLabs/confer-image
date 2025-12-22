@@ -1,0 +1,15 @@
+[Unit]
+Description=NVIDIA Confidential Computing PPCIe Attestation
+After=nvidia-persistenced.service nvidia-fabricmanager.service
+Requires=nvidia-persistenced.service nvidia-fabricmanager.service
+Before=confer-vllm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/tmp
+Environment="HOME=/tmp"
+ExecStart=/opt/venv-attestation/bin/python -m ppcie.verifier.verification --gpu-attestation-mode=LOCAL --switch-attestation-mode=LOCAL
+
+[Install]
+WantedBy=multi-user.target

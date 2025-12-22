@@ -1,0 +1,39 @@
+#!/bin/bash
+# mkosi prepare script
+# Runs before package installation to ensure repository configuration
+# Uses /buildroot paths since this runs outside the chroot
+
+set -euo pipefail
+
+echo "==> Prepare: Configuring apt to use snapshot repository only"
+
+# Ensure no mkosi-generated sources override our configuration
+# Remove any auto-generated sources.list.d files that mkosi might have created
+if [ -d "$BUILDROOT/etc/apt/sources.list.d" ]; then
+    echo "Removing any auto-generated repository configurations..."
+    rm -f "$BUILDROOT/etc/apt/sources.list.d"/*.list || true
+    rm -f "$BUILDROOT/etc/apt/sources.list.d"/*.sources || true
+fi
+
+# Verify our snapshot-only sources.list is in place
+if [ -f "$BUILDROOT/etc/apt/sources.list" ]; then
+    echo "Verifying snapshot repository configuration..."
+    if grep -q "snapshot.ubuntu.com" "$BUILDROOT/etc/apt/sources.list"; then
+        echo "✓ Snapshot repository configuration verified"
+    else
+        echo "ERROR: sources.list does not contain snapshot.ubuntu.com"
+        exit 1
+    fi
+
+    # Ensure no security.ubuntu.com or archive.ubuntu.com live repositories
+    if grep -q "security.ubuntu.com\|archive.ubuntu.com" "$BUILDROOT/etc/apt/sources.list" | grep -v "^#"; then
+        echo "ERROR: sources.list contains live repositories (security or archive)"
+        cat "$BUILDROOT/etc/apt/sources.list"
+        exit 1
+    fi
+else
+    echo "ERROR: /etc/apt/sources.list not found in buildroot"
+    exit 1
+fi
+
+echo "==> Prepare complete: Repository configuration verified"
