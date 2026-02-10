@@ -5,10 +5,10 @@
 # ALL packages come from the snapshot service, not live repos
 
 # Main repository
-deb http://snapshot.ubuntu.com/ubuntu/20260120T000000Z/ noble main restricted universe multiverse
+deb http://snapshot.ubuntu.com/ubuntu/20260209T000000Z/ noble main restricted universe multiverse
 
 # Updates repository (from snapshot, not live updates)
-deb http://snapshot.ubuntu.com/ubuntu/20260120T000000Z/ noble-updates main restricted universe multiverse
+deb http://snapshot.ubuntu.com/ubuntu/20260209T000000Z/ noble-updates main restricted universe multiverse
 
 # Security repository (from snapshot, not live security updates)
-deb http://snapshot.ubuntu.com/ubuntu/20260120T000000Z/ noble-security main restricted universe multiverse
+deb http://snapshot.ubuntu.com/ubuntu/20260209T000000Z/ noble-security main restricted universe multiverse
