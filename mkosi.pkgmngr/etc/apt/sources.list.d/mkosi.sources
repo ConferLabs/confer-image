@@ -1,0 +1,6 @@
+# All Ubuntu repos pinned to snapshot for reproducible builds
+Types: deb
+URIs: https://snapshot.ubuntu.com/ubuntu/20260209T000000Z
+Suites: noble noble-updates noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg

@@ -1,0 +1,4 @@
+Types: deb
+URIs: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
+Suites: /
+Signed-By: /usr/share/keyrings/cuda-archive-keyring.gpg
