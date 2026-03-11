@@ -139,7 +139,7 @@ freeze-requirements:
 	@rm -rf /tmp/vllm-freeze
 	@python3.12 -m venv /tmp/vllm-freeze
 	@/tmp/vllm-freeze/bin/pip install --upgrade pip
-	@/tmp/vllm-freeze/bin/pip install vllm==0.13.0
+	@/tmp/vllm-freeze/bin/pip install vllm==0.17.0
 	@/tmp/vllm-freeze/bin/pip freeze > requirements-vllm.lock
 	@rm -rf /tmp/vllm-freeze
 	@echo "Created requirements-vllm.lock with $$(wc -l < requirements-vllm.lock) pinned packages"

@@ -284,8 +284,9 @@ chroot /buildroot systemctl enable confer-boot.service
 chroot /buildroot systemctl enable confer-proxy.service
 chroot /buildroot systemctl enable vector.service
 
-# Make confer-boot script executable
+# Make scripts executable
 chmod +x /buildroot/usr/local/bin/confer-boot
+chmod +x /buildroot/usr/local/bin/confer-vllm
 
 # Mask services that don't work with read-only rootfs (dm-verity)
 # systemd-logind requires writable /var/lib/systemd which we don't have
