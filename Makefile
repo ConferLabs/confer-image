@@ -36,7 +36,7 @@ help:
 	@echo ""
 
 # Build the VM disk image and generate measurements
-build: mkosi.extra/requirements-vllm.lock mkosi.extra/requirements-attestation.lock mkosi.extra/requirements-docling.lock
+build: mkosi.extra/requirements-vllm.lock mkosi.extra/requirements-attestation.lock
 	@echo "Building confidential VM disk image with dm-verity..."
 	@echo "Image version: $(IMAGE_VERSION)"
 	@# Detect skeleton/config changes to decide if incremental cache should be cleared
@@ -126,12 +126,8 @@ mkosi.extra/requirements-attestation.lock: requirements-attestation.lock
 	@mkdir -p mkosi.extra
 	@cp requirements-attestation.lock mkosi.extra/
 
-mkosi.extra/requirements-docling.lock: requirements-docling.lock
-	@mkdir -p mkosi.extra
-	@cp requirements-docling.lock mkosi.extra/
-
 # Generate frozen Python requirements (run this once to create lock files)
-# vLLM, attestation SDK, and docling are installed separately due to dependency conflicts
+# vLLM and the attestation SDK are installed separately due to dependency conflicts
 freeze-requirements:
 	@echo "Generating frozen Python requirements..."
 	@echo ""
@@ -152,15 +148,6 @@ freeze-requirements:
 	@/tmp/attestation-freeze/bin/pip freeze > requirements-attestation.lock
 	@rm -rf /tmp/attestation-freeze
 	@echo "Created requirements-attestation.lock with $$(wc -l < requirements-attestation.lock) pinned packages"
-	@echo ""
-	@echo "==> Freezing docling-serve dependencies..."
-	@rm -rf /tmp/docling-freeze
-	@python3.12 -m venv /tmp/docling-freeze
-	@/tmp/docling-freeze/bin/pip install --upgrade pip
-	@/tmp/docling-freeze/bin/pip install --extra-index-url https://download.pytorch.org/whl/cu128 docling-serve==1.11.0
-	@/tmp/docling-freeze/bin/pip freeze > requirements-docling.lock
-	@rm -rf /tmp/docling-freeze
-	@echo "Created requirements-docling.lock with $$(wc -l < requirements-docling.lock) pinned packages"
 
 # Clean build artifacts
 clean:

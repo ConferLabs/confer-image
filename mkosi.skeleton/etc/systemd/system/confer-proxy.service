@@ -1,9 +1,9 @@
 [Unit]
 Description=Confer Proxy Service
-After=network-online.target mnt-config.mount confer-vllm.service confer-docling.service java-cacerts-init.service confer-boot.service
+After=network-online.target mnt-config.mount confer-vllm.service confer-document-worker.socket java-cacerts-init.service confer-boot.service
 Wants=network-online.target
-Requires=mnt-config.mount java-cacerts-init.service confer-boot.service
-Wants=confer-vllm.service confer-docling.service
+Requires=mnt-config.mount java-cacerts-init.service confer-boot.service confer-document-worker.socket
+Wants=confer-vllm.service confer-document-worker.socket
 
 [Service]
 Type=simple

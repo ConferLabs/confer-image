@@ -112,140 +112,6 @@ else
     exit 1
 fi
 
-# Stage 3: Install docling-serve in isolated venv 
-echo "==> Installing docling-serve in /opt/venv-docling"
-if [ -f /buildroot/requirements-docling.lock ]; then
-    DOCLING_HASH=$(sha256sum /buildroot/requirements-docling.lock | cut -d' ' -f1)
-    DOCLING_HASH_FILE="/buildroot/opt/.requirements-docling.hash"
-
-    if [ -f "$DOCLING_HASH_FILE" ] && [ "$(cat "$DOCLING_HASH_FILE")" = "$DOCLING_HASH" ]; then
-        echo "✓ Docling already installed with matching requirements, skipping"
-    else
-        echo "Running pip install for docling-serve..."
-        cp /buildroot/requirements-docling.lock /buildroot/tmp/requirements-docling.lock
-
-        # Create venv for docling
-        chroot /buildroot python3 -m venv /opt/venv-docling
-
-        chroot /buildroot /opt/venv-docling/bin/pip install \
-            --no-cache-dir \
-            --extra-index-url https://download.pytorch.org/whl/cu128 \
-            -r /tmp/requirements-docling.lock
-
-        # Verify docling-serve was installed
-        if [ -f /buildroot/opt/venv-docling/bin/docling-serve ]; then
-            echo "✓ docling-serve installed in venv"
-        else
-            echo "ERROR: docling-serve binary not found after pip install"
-            exit 1
-        fi
-
-        # See: https://docling-project.github.io/docling/usage/gpu/
-        PIPELINE_OPTIONS="/buildroot/opt/venv-docling/lib/python3.12/site-packages/docling/datamodel/pipeline_options.py"
-        if [ -f "$PIPELINE_OPTIONS" ]; then
-            sed -i 's/] = "onnxruntime"/] = "torch"/' "$PIPELINE_OPTIONS"
-            echo "✓ Patched RapidOCR to use torch backend"
-        else
-            echo "ERROR: Could not find pipeline_options.py to patch RapidOCR backend"
-            exit 1
-        fi
-
-        # See: https://github.com/docling-project/docling-serve/issues/434
-        ACCELERATOR_OPTIONS="/buildroot/opt/venv-docling/lib/python3.12/site-packages/docling/datamodel/accelerator_options.py"
-        if [ -f "$ACCELERATOR_OPTIONS" ]; then
-            echo "Before AcceleratorOptions patch:"
-            grep '] = "auto"\|] = "cuda"' "$ACCELERATOR_OPTIONS" || true
-
-            sed -i 's/] = "auto"/] = "cuda"/' "$ACCELERATOR_OPTIONS"
-
-            echo "After AcceleratorOptions patch:"
-            grep '] = "auto"\|] = "cuda"' "$ACCELERATOR_OPTIONS" || true
-
-            if grep -q '] = "cuda"' "$ACCELERATOR_OPTIONS"; then
-                echo "✓ Patched AcceleratorOptions to default to CUDA"
-                # Remove bytecode cache to ensure patched source is used
-                rm -rf /buildroot/opt/venv-docling/lib/python3.12/site-packages/docling/datamodel/__pycache__
-            else
-                echo "ERROR: AcceleratorOptions patch did not apply correctly"
-                exit 1
-            fi
-        else
-            echo "ERROR: Could not find accelerator_options.py to patch device default"
-            exit 1
-        fi
-
-        # See: https://github.com/huggingface/transformers/issues/23145
-        LAYOUT_PREDICTOR="/buildroot/opt/venv-docling/lib/python3.12/site-packages/docling_ibm_models/layoutmodel/layout_predictor.py"
-        if [ -f "$LAYOUT_PREDICTOR" ]; then
-            echo "Before LayoutPredictor patch:"
-            grep -n 'from_pretrained\|\.to(' "$LAYOUT_PREDICTOR" | head -5
-
-            # Remove device_map parameter and add .to(self._device) after model loading
-            # Original: self._model = AutoModelForObjectDetection.from_pretrained(
-            #               artifact_path, config=self._model_config, device_map=self._device
-            #           )
-            # Patched:  self._model = AutoModelForObjectDetection.from_pretrained(
-            #               artifact_path, config=self._model_config
-            #           ).to(self._device)
-            python3 -c "
-import re
-with open('$LAYOUT_PREDICTOR', 'r') as f:
-    content = f.read()
-content = content.replace(', device_map=self._device', '')
-content = re.sub(r'(config=self._model_config\n\s+)\)', r'\1).to(self._device)', content)
-with open('$LAYOUT_PREDICTOR', 'w') as f:
-    f.write(content)
-"
-
-            echo "After LayoutPredictor patch:"
-            grep -n 'from_pretrained\|\.to(' "$LAYOUT_PREDICTOR" | head -5
-
-            if grep -q '\.to(self._device' "$LAYOUT_PREDICTOR" && ! grep -q 'device_map' "$LAYOUT_PREDICTOR"; then
-                echo "✓ Patched LayoutPredictor to use .to(device) instead of device_map"
-                rm -rf /buildroot/opt/venv-docling/lib/python3.12/site-packages/docling_ibm_models/layoutmodel/__pycache__
-            else
-                echo "ERROR: LayoutPredictor patch did not apply correctly"
-                exit 1
-            fi
-        else
-            echo "ERROR: Could not find layout_predictor.py to patch device_map bug"
-            exit 1
-        fi
-
-        RAPIDOCR_MODELS="/buildroot/opt/venv-docling/lib/python3.12/site-packages/rapidocr/models"
-        mkdir -p "$RAPIDOCR_MODELS"
-        echo "Downloading RapidOCR torch models..."
-
-        # Detection model
-        curl -fsSL "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/torch/PP-OCRv4/det/ch_PP-OCRv4_det_infer.pth" \
-            -o "$RAPIDOCR_MODELS/ch_PP-OCRv4_det_infer.pth"
-        echo "89622c3f3e76b3ac7d10d9434c1f117a7471dba44723885cc04b49932a740d5b  $RAPIDOCR_MODELS/ch_PP-OCRv4_det_infer.pth" | sha256sum -c -
-
-        # Recognition model
-        curl -fsSL "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/torch/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer.pth" \
-            -o "$RAPIDOCR_MODELS/ch_PP-OCRv4_rec_infer.pth"
-        echo "cb4265bb4300a2487e93e82ccfa1924bf9cd1194c1a202ab17a96b4911c27e0b  $RAPIDOCR_MODELS/ch_PP-OCRv4_rec_infer.pth" | sha256sum -c -
-
-        # Classification model
-        curl -fsSL "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/torch/PP-OCRv4/cls/ch_ptocr_mobile_v2.0_cls_infer.pth" \
-            -o "$RAPIDOCR_MODELS/ch_ptocr_mobile_v2.0_cls_infer.pth"
-        echo "bfe13860824b3365c0c7f7ccfcddc8ff11645c60051739ff18bc9913f60c98e1  $RAPIDOCR_MODELS/ch_ptocr_mobile_v2.0_cls_infer.pth" | sha256sum -c -
-
-        # Recognition dictionary
-        curl -fsSL "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt" \
-            -o "$RAPIDOCR_MODELS/ppocr_keys_v1.txt"
-
-        echo "✓ RapidOCR models downloaded"
-
-        # Store hash for future builds
-        echo "$DOCLING_HASH" > "$DOCLING_HASH_FILE"
-        rm -f /buildroot/tmp/requirements-docling.lock
-    fi
-    rm -f /buildroot/requirements-docling.lock
-else
-    echo "ERROR: requirements-docling.lock not found"
-    exit 1
-fi
 
 echo "✓ Python packages installed successfully"
 
@@ -279,8 +145,8 @@ chroot /buildroot systemctl enable nvidia-persistenced.service
 chroot /buildroot systemctl enable nvidia-fabricmanager.service
 chroot /buildroot systemctl enable nvidia-cc-attestation.service
 chroot /buildroot systemctl enable confer-vllm.service
-chroot /buildroot systemctl enable confer-docling.service
 chroot /buildroot systemctl enable confer-boot.service
+chroot /buildroot systemctl enable confer-document-worker.socket
 chroot /buildroot systemctl enable confer-proxy.service
 chroot /buildroot systemctl enable vector.service
 

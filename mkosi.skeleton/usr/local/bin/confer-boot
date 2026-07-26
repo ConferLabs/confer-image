@@ -10,8 +10,11 @@ PROXY_MOUNT="/mnt/proxy"
 PROXY_DIR="/run/confer"
 PROXY_ZIP="${PROXY_DIR}/proxy.zip"
 PROXY_JAR="${PROXY_DIR}/proxy.jar"
+DOCUMENT_WORKER_STAGING="${PROXY_DIR}/document-worker"
+DOCUMENT_WORKER_DIR="/run/confer-document-worker"
 MANIFEST_JSON="${PROXY_DIR}/manifest.json"
 MANIFEST_BUNDLE="${PROXY_DIR}/manifest.bundle.json"
+CMDLINE_PATH="${CONFER_CMDLINE_PATH:-/proc/cmdline}"
 
 log() {
     echo "[confer-boot] $*"
@@ -25,7 +28,7 @@ error() {
 # Extract parameter from kernel cmdline
 get_cmdline_param() {
     local param="$1"
-    cat /proc/cmdline | tr ' ' '\n' | grep "^${param}=" | cut -d= -f2-
+    cat "$CMDLINE_PATH" | tr ' ' '\n' | grep "^${param}=" | cut -d= -f2-
 }
 
 # Main
@@ -69,12 +72,30 @@ cd "$PROXY_DIR"
 unzip -q "$PROXY_ZIP"
 rm -f "$PROXY_ZIP"  # Free up ramdisk space
 
+if [ ! -d "$DOCUMENT_WORKER_STAGING" ]; then
+    error "document worker runtime not found in archive"
+fi
+
+# Keep the untrusted parser runtime outside the proxy's runtime tree. The
+# worker's mount namespace exposes this directory while hiding /run/confer in
+# its entirety, so future proxy files cannot become readable by accident.
+if [ -e "$DOCUMENT_WORKER_DIR" ]; then
+    error "document worker runtime destination already exists"
+fi
+mv "$DOCUMENT_WORKER_STAGING" "$DOCUMENT_WORKER_DIR"
+
 # Verify proxy.jar exists
 if [ ! -f "$PROXY_JAR" ]; then
     error "proxy.jar not found in archive"
 fi
 
+if ! PYTHONPATH="${DOCUMENT_WORKER_DIR}/runtime:${DOCUMENT_WORKER_DIR}/src" \
+    python3 -S -m confer_document_worker.main --check >/dev/null; then
+    error "document worker runtime failed its self-check"
+fi
+
 log "Proxy ready at $PROXY_JAR"
+log "Document worker ready"
 
 # Copy manifest files from proxy disk
 log "Copying manifest files..."

@@ -1,0 +1,81 @@
+[Unit]
+Description=Confer Sandboxed Document Worker
+Requires=confer-boot.service
+After=confer-boot.service
+
+[Service]
+Type=exec
+DynamicUser=yes
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Environment=HOME=/tmp
+Environment=LANG=C.UTF-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/run/confer-document-worker/runtime:/run/confer-document-worker/src
+# Restrict imports to the bundled parser runtime.
+ExecStart=/usr/bin/python3 -S -m confer_document_worker.main
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateIPC=yes
+PrivateMounts=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectHostname=yes
+ProtectProc=noaccess
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@aio @chown @keyring @memlock @privileged @resources @setuid
+SystemCallFilter=~@network-io
+SystemCallFilter=~kcmp memfd_create name_to_handle_at userfaultfd
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=none
+IPAddressDeny=any
+UMask=0077
+
+TemporaryFileSystem=/:ro,nosuid,nodev,noexec
+BindReadOnlyPaths=/usr/bin/python3 /usr/bin/python3.12 /usr/bin/tesseract
+BindReadOnlyPaths=/usr/lib/python3 /usr/lib/python3.12 /usr/share/tesseract-ocr
+BindReadOnlyPaths=-/usr/lib/locale -/usr/share/fonts -/usr/share/fontconfig
+BindReadOnlyPaths=-/lib/x86_64-linux-gnu -/lib/aarch64-linux-gnu
+BindReadOnlyPaths=-/lib64/ld-linux-x86-64.so.2 -/lib/ld-linux-aarch64.so.1
+BindReadOnlyPaths=/run/confer-document-worker
+BindReadOnlyPaths=-/etc/ld.so.cache -/etc/fonts -/var/cache/fontconfig
+InaccessiblePaths=/mnt /run/confer /run/java-cacerts
+NoExecPaths=/
+ExecPaths=/usr/bin/python3 /usr/bin/python3.12 /usr/bin/tesseract
+ExecPaths=/usr/lib/python3 /usr/lib/python3.12 /run/confer-document-worker/runtime
+ExecPaths=-/lib/x86_64-linux-gnu -/lib/aarch64-linux-gnu
+ExecPaths=-/lib64/ld-linux-x86-64.so.2 -/lib/ld-linux-aarch64.so.1
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=4G
+TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,size=16M
+
+MemoryMax=8G
+MemorySwapMax=0
+TasksMax=64
+RuntimeMaxSec=5min
+LimitCORE=0
+LimitFSIZE=4G
+LimitNOFILE=512
+CPUQuota=800%
+CPUWeight=20
+IOWeight=20
+OOMPolicy=stop

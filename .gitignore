@@ -17,3 +17,7 @@ mkosi.cache/
 
 doc/
 /bin/
+
+# Python test artifacts
+__pycache__/
+*.pyc
