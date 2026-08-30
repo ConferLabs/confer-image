@@ -13,11 +13,13 @@ args=(
   --max-model-len "$VLLM_MAX_MODEL_LEN"
   --max-num-seqs "$VLLM_MAX_NUM_SEQS"
   --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS"
+  --compilation-config.pass_config.fuse_allreduce_rms false
 )
 
 [ -n "${VLLM_REASONING_PARSER:-}" ]        && args+=(--reasoning-parser "$VLLM_REASONING_PARSER")
 [ -n "${VLLM_MM_ENCODER_TP_MODE:-}" ]      && args+=(--mm-encoder-tp-mode "$VLLM_MM_ENCODER_TP_MODE")
 [ -n "${VLLM_MM_PROCESSOR_CACHE_TYPE:-}" ] && args+=(--mm-processor-cache-type "$VLLM_MM_PROCESSOR_CACHE_TYPE")
+[ -n "${VLLM_MTP_TOKENS:-}" ]              && args+=(--spec-method mtp --spec-tokens "$VLLM_MTP_TOKENS")
 [[ "${VLLM_ENABLE_CHUNKED_PREFILL:-1}" =~ ^(1|true|yes)$ ]] && args+=(--enable-chunked-prefill)
 [[ "${VLLM_ENABLE_PREFIX_CACHING:-0}" =~ ^(1|true|yes)$ ]]  && args+=(--enable-prefix-caching)
 

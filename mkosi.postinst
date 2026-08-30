@@ -115,6 +115,12 @@ fi
 
 echo "✓ Python packages installed successfully"
 
+echo "==> Configuring DCAP collateral provider"
+install -m 0444 \
+    /buildroot/usr/lib/confer/sgx_default_qcnl.conf \
+    /buildroot/etc/sgx_default_qcnl.conf
+echo "✓ DCAP collateral provider configured"
+
 # Install Vector static binary (apt package has dependency issues with snapshot repos)
 echo "==> Installing Vector log shipper"
 VECTOR_VERSION="0.51.1"

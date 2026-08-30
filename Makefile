@@ -40,7 +40,8 @@ build: mkosi.extra/requirements-vllm.lock mkosi.extra/requirements-attestation.l
 	@echo "Building confidential VM disk image with dm-verity..."
 	@echo "Image version: $(IMAGE_VERSION)"
 	@# Detect skeleton/config changes to decide if incremental cache should be cleared
-	@SKELETON_HASH=$$(find mkosi.skeleton mkosi.conf -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | cut -d' ' -f1); \
+	@set -e; \
+	SKELETON_HASH=$$(find mkosi.skeleton mkosi.conf -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | cut -d' ' -f1); \
 	if [ "$$SKELETON_HASH" != "$$(cat .skeleton-hash 2>/dev/null)" ]; then \
 		echo "Skeleton/config changed, clearing incremental cache..."; \
 		sudo $$(which mkosi) --force --force --image-version=$(IMAGE_VERSION); \
@@ -135,7 +136,7 @@ freeze-requirements:
 	@rm -rf /tmp/vllm-freeze
 	@python3.12 -m venv /tmp/vllm-freeze
 	@/tmp/vllm-freeze/bin/pip install --upgrade pip
-	@/tmp/vllm-freeze/bin/pip install vllm==0.17.0
+	@/tmp/vllm-freeze/bin/pip install vllm==0.27.1
 	@/tmp/vllm-freeze/bin/pip freeze > requirements-vllm.lock
 	@rm -rf /tmp/vllm-freeze
 	@echo "Created requirements-vllm.lock with $$(wc -l < requirements-vllm.lock) pinned packages"

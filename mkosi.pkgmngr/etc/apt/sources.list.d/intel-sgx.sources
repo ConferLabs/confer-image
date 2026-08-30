@@ -1,0 +1,6 @@
+Types: deb
+URIs: https://download.01.org/intel-sgx/sgx_repo/ubuntu
+Suites: noble
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/intel-sgx-deb.asc
