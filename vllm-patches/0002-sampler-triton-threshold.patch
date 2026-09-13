@@ -7,7 +7,7 @@ vocabulary the Triton kernel is faster from one row up (VLLM_TOPK_TOPP_TRITON_MI
  logger = init_logger(__name__)
  
  
-+_TRITON_MIN_ROWS = int(__import__("os").environ.get("VLLM_TOPK_TOPP_TRITON_MIN_ROWS", "8"))
++_TRITON_MIN_ROWS = int(__import__("os").environ.get("VLLM_TOPK_TOPP_TRITON_MIN_ROWS", "1"))
 +
  def _skip_aiter_sampler_on_gfx1250() -> bool:
      # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
