@@ -1,0 +1,26 @@
+Batches under 8 rows sort the full vocabulary per row for top-k/top-p; with a 248k
+vocabulary the Triton kernel is faster from one row up (VLLM_TOPK_TOPP_TRITON_MIN_ROWS).
+
+--- a/v1/sample/ops/topk_topp_sampler.py
++++ b/v1/sample/ops/topk_topp_sampler.py
+@@ -18,6 +18,8 @@
+ logger = init_logger(__name__)
+ 
+ 
++_TRITON_MIN_ROWS = int(__import__("os").environ.get("VLLM_TOPK_TOPP_TRITON_MIN_ROWS", "8"))
++
+ def _skip_aiter_sampler_on_gfx1250() -> bool:
+     # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
+     from vllm.platforms.rocm import on_gfx1250
+@@ -357,7 +359,10 @@
+             return apply_top_k_top_p_triton(logits, k, p)
+         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+ 
+-    if HAS_TRITON and logits.shape[0] >= 8:
++    # Below VLLM_TOPK_TOPP_TRITON_MIN_ROWS rows (default 1 here) the PyTorch path would sort
++    # the full vocabulary per row, which for a 248k vocab costs more GPU time than the Triton
++    # kernel even at one row; speculative decoding samples a handful of rows per step.
++    if HAS_TRITON and logits.shape[0] >= _TRITON_MIN_ROWS:
+         return apply_top_k_top_p_triton(logits, k, p)
+ 
+     # Use pytorch sort implementation for small batch sizes.

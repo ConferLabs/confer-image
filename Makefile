@@ -1,4 +1,4 @@
-.PHONY: help build clean freeze-requirements extract-uki extract-boot-artifacts
+.PHONY: check-vllm-patches help build clean freeze-requirements extract-uki extract-boot-artifacts
 
 # Image version - can be overridden via IMAGE_VERSION=x.y.z, defaults to mkosi.conf
 IMAGE_VERSION ?= $(shell grep '^ImageVersion=' mkosi.conf | cut -d= -f2)
@@ -36,7 +36,7 @@ help:
 	@echo ""
 
 # Build the VM disk image and generate measurements
-build: mkosi.extra/requirements-vllm.lock mkosi.extra/requirements-attestation.lock
+build: mkosi.extra/requirements-vllm.lock mkosi.extra/requirements-attestation.lock mkosi.extra/vllm-patches
 	@echo "Building confidential VM disk image with dm-verity..."
 	@echo "Image version: $(IMAGE_VERSION)"
 	@# Detect skeleton/config changes to decide if incremental cache should be cleared
@@ -123,6 +123,11 @@ mkosi.extra/requirements-vllm.lock: requirements-vllm.lock
 	@mkdir -p mkosi.extra
 	@cp requirements-vllm.lock mkosi.extra/
 
+mkosi.extra/vllm-patches: $(wildcard vllm-patches/*)
+	@rm -rf mkosi.extra/vllm-patches
+	@mkdir -p mkosi.extra
+	@cp -r vllm-patches mkosi.extra/
+
 mkosi.extra/requirements-attestation.lock: requirements-attestation.lock
 	@mkdir -p mkosi.extra
 	@cp requirements-attestation.lock mkosi.extra/
@@ -136,7 +141,7 @@ freeze-requirements:
 	@rm -rf /tmp/vllm-freeze
 	@python3.12 -m venv /tmp/vllm-freeze
 	@/tmp/vllm-freeze/bin/pip install --upgrade pip
-	@/tmp/vllm-freeze/bin/pip install vllm==0.27.1
+	@/tmp/vllm-freeze/bin/pip install vllm==0.29.0
 	@/tmp/vllm-freeze/bin/pip freeze > requirements-vllm.lock
 	@rm -rf /tmp/vllm-freeze
 	@echo "Created requirements-vllm.lock with $$(wc -l < requirements-vllm.lock) pinned packages"
@@ -149,6 +154,18 @@ freeze-requirements:
 	@/tmp/attestation-freeze/bin/pip freeze > requirements-attestation.lock
 	@rm -rf /tmp/attestation-freeze
 	@echo "Created requirements-attestation.lock with $$(wc -l < requirements-attestation.lock) pinned packages"
+
+# Verify vllm-patches/ against the pinned vLLM release on PyPI: download the wheel (no deps),
+# extract the patched files, apply the patches with no fuzz and compare with hashes.txt.
+check-vllm-patches:
+	@set -e; tmp=$$(mktemp -d); ver=$$(grep '^vllm==' requirements-vllm.lock | cut -d= -f3); \
+	url=$$(curl -sf "https://pypi.org/pypi/vllm/$$ver/json" | python3 -c 'import json,sys; print(next(u["url"] for u in json.load(sys.stdin)["urls"] if u["filename"].endswith("x86_64.whl")))'); \
+	echo "==> Downloading vllm==$$ver wheel"; curl -sfL -o $$tmp/vllm.whl "$$url"; \
+	cd $$tmp && unzip -q -o vllm.whl $$(awk '{print "vllm/"$$1}' $(CURDIR)/vllm-patches/hashes.txt); \
+	while read -r rel stock patched; do [ "$$(shasum -a 256 vllm/$$rel | cut -d' ' -f1)" = "$$stock" ] || { echo "ERROR: stock $$rel differs from vllm==$$ver"; exit 1; }; done < $(CURDIR)/vllm-patches/hashes.txt; \
+	for p in $(CURDIR)/vllm-patches/*.patch; do patch -p1 --forward --fuzz=0 -s -d vllm -i $$p || { echo "ERROR: $$(basename $$p) does not apply"; exit 1; }; done; \
+	while read -r rel stock patched; do [ "$$(shasum -a 256 vllm/$$rel | cut -d' ' -f1)" = "$$patched" ] || { echo "ERROR: patched $$rel differs from hashes.txt"; exit 1; }; done < $(CURDIR)/vllm-patches/hashes.txt; \
+	echo "vLLM patches verified against vllm==$$ver"; rm -rf $$tmp
 
 # Clean build artifacts
 clean:

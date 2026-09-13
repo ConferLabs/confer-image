@@ -1,0 +1,48 @@
+Tensor-parallel workers: the output thread would read each step's tokens back as soon as
+the step is enqueued, and under CC that blocking readback stalls the rank's launches (and,
+through the all-reduce, every rank). VLLM_CC_WORKER_DRAIN_LAG=1 holds outputs back by
+depth-1 steps; VLLM_CC_WORKER_DRAIN_FLUSH_MS bounds the delay when the engine goes idle.
+
+--- a/v1/executor/multiproc_executor.py
++++ b/v1/executor/multiproc_executor.py
+@@ -1022,9 +1022,38 @@
+         if hasattr(self.worker, "device"):
+             current_platform.set_device(self.worker.device)
+ 
++        # Confidential-computing multi-step mode: the engine keeps N steps in flight and
++        # only needs a step's tokens once its batch queue is full, but draining an output
++        # here forces its (blocking, under CC) device-to-host readback immediately, which
++        # also stalls this worker's kernel launches. Hold outputs back by N-1 steps so the
++        # readback happens when the step has long finished; flush when the queue goes idle
++        # so a pause in scheduling never waits on outputs that no later step will push out.
++        import os
++        import queue as _queue
++        from collections import deque
++        lag = 0
++        if os.environ.get("VLLM_CC_WORKER_DRAIN_LAG", "0") == "1" and os.environ.get(
++            "VLLM_CC_LAZY_READBACK", "0"
++        ) == "1":
++            lag = max(0, int(os.environ.get("VLLM_CC_INFLIGHT_STEPS", "0")) - 1)
++        if lag == 0:
++            while True:
++                output = self.async_output_queue.get()
++                self.enqueue_output(output)
++        # The idle flush must be slower than one step's host enqueue, or steady-state
++        # decode flushes every step and the readback lands on a just-launched step.
++        flush_s = float(os.environ.get("VLLM_CC_WORKER_DRAIN_FLUSH_MS", "20")) / 1e3
++        pending: deque = deque()
+         while True:
+-            output = self.async_output_queue.get()
+-            self.enqueue_output(output)
++            try:
++                output = self.async_output_queue.get(timeout=flush_s)
++            except _queue.Empty:
++                while pending:
++                    self.enqueue_output(pending.popleft())
++                continue
++            pending.append(output)
++            while len(pending) > lag:
++                self.enqueue_output(pending.popleft())
+ 
+     def worker_busy_loop(self):
+         """Main busy loop for Multiprocessing Workers"""

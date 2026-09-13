@@ -1,5 +1,38 @@
 #!/bin/bash
+# vLLM launcher.
+#
+# Configuration is read only from the named variables below (EnvironmentFile in
+# confer-vllm.service). Every engine flag is spelled out here and vLLM runs under
+# env -i, so nothing else in the environment can reach it.
+#
+#   VLLM_MODEL, VLLM_SERVED_MODEL_NAME, VLLM_HOST, VLLM_PORT
+#   VLLM_GPU_MEMORY             fraction of GPU memory the engine may use
+#   VLLM_TENSOR_PARALLEL_SIZE, VLLM_MAX_MODEL_LEN, VLLM_MAX_NUM_SEQS
+#   VLLM_TOOL_CALL_PARSER, VLLM_REASONING_PARSER
+#   VLLM_ENABLE_EXPERT_PARALLEL 0 (default) | 1
+#   VLLM_MAX_NUM_BATCHED_TOKENS, VLLM_MM_ENCODER_TP_MODE, VLLM_MM_PROCESSOR_CACHE_TYPE
+#   VLLM_MTP_TOKENS             speculative draft tokens per step; unset = no speculation
+#   VLLM_MAMBA_SSM_CACHE_DTYPE  e.g. bfloat16; unset = engine default
+#   VLLM_ENABLE_CHUNKED_PREFILL 1 (default) | 0
+#   VLLM_ENABLE_PREFIX_CACHING  0 (default) | 1
+#   VLLM_ASYNC_SCHEDULING       1 (default) | 0 to run the scheduler synchronously
+#   VLLM_GDN_DECODE_KERNEL      cuda (default) | triton
+#   VLLM_MODEL_RUNNER           v2 (default) | v1 (the pre-0.29 GPU model runner)
+#   VLLM_CUDA_LAUNCH_BLOCKING   0 (default) | 1 serialises kernel launches so a device-side
+#                               assert names the faulting kernel; slow, diagnosis only
+#   VLLM_CC_MULTISTEP           0 (default) | 2..8 = number of decode steps kept in flight with a
+#                               deferred token readback (Model Runner V2 only; see the vLLM source
+#                               overrides). Depths 2 to 4 measure the same under TP8; 3 is the
+#                               reference configuration.
 
+set -u
+
+is_true() { [[ "${1:-0}" =~ ^(1|true|yes)$ ]]; }
+
+case "${VLLM_GDN_DECODE_KERNEL:-cuda}" in cuda|triton) ;; *) echo "confer-vllm: VLLM_GDN_DECODE_KERNEL must be cuda or triton" >&2; exit 64 ;; esac
+case "${VLLM_MODEL_RUNNER:-v2}" in v1|v2) ;; *) echo "confer-vllm: VLLM_MODEL_RUNNER must be v1 or v2" >&2; exit 64 ;; esac
+case "${VLLM_CUDA_LAUNCH_BLOCKING:-0}" in 0|1) ;; *) echo "confer-vllm: VLLM_CUDA_LAUNCH_BLOCKING must be 0 or 1" >&2; exit 64 ;; esac
+case "${VLLM_CC_MULTISTEP:-0}" in 0|[2-8]) ;; *) echo "confer-vllm: VLLM_CC_MULTISTEP must be 0 or a step count from 2 to 8" >&2; exit 64 ;; esac
 args=(
   --model "$VLLM_MODEL"
   --served-model-name "$VLLM_SERVED_MODEL_NAME"
@@ -7,7 +40,6 @@ args=(
   --port "$VLLM_PORT"
   --gpu-memory-utilization "$VLLM_GPU_MEMORY"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
-  --enable-expert-parallel
   --enable-auto-tool-choice
   --tool-call-parser "$VLLM_TOOL_CALL_PARSER"
   --max-model-len "$VLLM_MAX_MODEL_LEN"
@@ -15,18 +47,36 @@ args=(
   --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS"
   --compilation-config.pass_config.fuse_allreduce_rms false
 )
+is_true "${VLLM_ENABLE_EXPERT_PARALLEL:-0}"  && args+=(--enable-expert-parallel)
+[ -n "${VLLM_REASONING_PARSER:-}" ]          && args+=(--reasoning-parser "$VLLM_REASONING_PARSER")
+[ -n "${VLLM_MM_ENCODER_TP_MODE:-}" ]        && args+=(--mm-encoder-tp-mode "$VLLM_MM_ENCODER_TP_MODE")
+[ -n "${VLLM_MM_PROCESSOR_CACHE_TYPE:-}" ]   && args+=(--mm-processor-cache-type "$VLLM_MM_PROCESSOR_CACHE_TYPE")
+[ -n "${VLLM_MTP_TOKENS:-}" ]                && args+=(--speculative-config.method mtp
+                                                      --speculative-config.num_speculative_tokens "$VLLM_MTP_TOKENS")
+[ -n "${VLLM_MAMBA_SSM_CACHE_DTYPE:-}" ]     && args+=(--mamba-ssm-cache-dtype "$VLLM_MAMBA_SSM_CACHE_DTYPE")
+is_true "${VLLM_ENABLE_CHUNKED_PREFILL:-1}"  && args+=(--enable-chunked-prefill)
+is_true "${VLLM_ENABLE_PREFIX_CACHING:-0}"   && args+=(--enable-prefix-caching)
+is_true "${VLLM_ASYNC_SCHEDULING:-1}"        || args+=(--no-async-scheduling)
 
-[ -n "${VLLM_REASONING_PARSER:-}" ]        && args+=(--reasoning-parser "$VLLM_REASONING_PARSER")
-[ -n "${VLLM_MM_ENCODER_TP_MODE:-}" ]      && args+=(--mm-encoder-tp-mode "$VLLM_MM_ENCODER_TP_MODE")
-[ -n "${VLLM_MM_PROCESSOR_CACHE_TYPE:-}" ] && args+=(--mm-processor-cache-type "$VLLM_MM_PROCESSOR_CACHE_TYPE")
-[ -n "${VLLM_MTP_TOKENS:-}" ]              && args+=(--spec-method mtp --spec-tokens "$VLLM_MTP_TOKENS")
-[[ "${VLLM_ENABLE_CHUNKED_PREFILL:-1}" =~ ^(1|true|yes)$ ]] && args+=(--enable-chunked-prefill)
-[[ "${VLLM_ENABLE_PREFIX_CACHING:-0}" =~ ^(1|true|yes)$ ]]  && args+=(--enable-prefix-caching)
+# Engine environment beyond the fixed set below; unset means the engine default.
+engine_env=()
+[ "${VLLM_MODEL_RUNNER:-v2}" = v1 ]          && engine_env+=(VLLM_USE_V2_MODEL_RUNNER=0)
+is_true "${VLLM_CUDA_LAUNCH_BLOCKING:-0}"    && engine_env+=(CUDA_LAUNCH_BLOCKING=1)
+[ "${VLLM_CC_MULTISTEP:-0}" != 0 ]           && engine_env+=(VLLM_CC_INFLIGHT_STEPS="$VLLM_CC_MULTISTEP" VLLM_CC_LAZY_READBACK=1 VLLM_CC_H2D_STREAM=1 VLLM_PINNED_STAGING=1 VLLM_CC_WORKER_DRAIN_LAG=1)
 
+# Confidential-computing guests have no NVSwitch multicast or symmetric-memory
+# support, so keep vLLM on its custom (IPC) all-reduce with NCCL fallback.
+# They also cannot serve GPU reads of pinned host memory in place, so Model Runner
+# V2 must stage its inputs through explicit copies (see the vLLM source override).
 exec env -i \
   PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin \
   CUDA_HOME=/usr/local/cuda \
   HOME=/tmp \
   HF_HUB_CACHE=/tmp/huggingface \
   XDG_CACHE_HOME=/tmp/.cache \
+  VLLM_ALLREDUCE_USE_FLASHINFER=0 \
+  VLLM_ALLREDUCE_USE_SYMM_MEM=0 \
+  VLLM_GDN_DECODE_KERNEL="${VLLM_GDN_DECODE_KERNEL:-cuda}" \
+  VLLM_UVA_ZERO_COPY=0 \
+  "${engine_env[@]}" \
   /usr/bin/python3 -m vllm.entrypoints.openai.api_server "${args[@]}"

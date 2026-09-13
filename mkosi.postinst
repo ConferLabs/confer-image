@@ -75,6 +75,38 @@ else
     exit 1
 fi
 
+# Stage 1b: vLLM source patches (vllm-patches/). Each patch is a unified diff against the pinned
+# vLLM release, applied with no fuzz; its header says what it is for. vllm-patches/hashes.txt
+# lists every patched file with its stock and patched sha256, so a vLLM upgrade that changes one
+# of these files fails the build instead of silently dropping the change.
+VLLM_SP=/buildroot/usr/local/lib/python3.12/dist-packages/vllm
+VLLM_PATCHES=/buildroot/vllm-patches
+command -v patch >/dev/null || { echo "ERROR: patch(1) is required to build the image"; exit 1; }
+[ -f "$VLLM_PATCHES/hashes.txt" ] || { echo "ERROR: vllm-patches/hashes.txt not found"; exit 1; }
+vllm_state=""
+while read -r rel stock patched; do
+    have=$(sha256sum "$VLLM_SP/$rel" | cut -d' ' -f1)
+    if [ "$have" = "$patched" ]; then this=patched
+    elif [ "$have" = "$stock" ]; then this=stock
+    else echo "ERROR: $rel does not match the vLLM release the patches were made for"; exit 1; fi
+    [ -n "$vllm_state" ] || vllm_state=$this
+    [ "$vllm_state" = "$this" ] || { echo "ERROR: vLLM source tree is partially patched"; exit 1; }
+done < "$VLLM_PATCHES/hashes.txt"
+if [ "$vllm_state" = patched ]; then
+    echo "✓ vLLM patches already applied"
+else
+    for patch_file in "$VLLM_PATCHES"/*.patch; do
+        patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -s -d "$VLLM_SP" -i "$patch_file" \
+            || { echo "ERROR: $(basename "$patch_file") did not apply cleanly"; exit 1; }
+        echo "✓ applied $(basename "$patch_file")"
+    done
+    while read -r rel stock patched; do
+        [ "$(sha256sum "$VLLM_SP/$rel" | cut -d' ' -f1)" = "$patched" ] \
+            || { echo "ERROR: $rel does not match its expected hash after patching"; exit 1; }
+    done < "$VLLM_PATCHES/hashes.txt"
+fi
+rm -rf /buildroot/vllm-patches
+
 # Stage 2: Install attestation SDK in isolated venv (skip if already installed with same requirements)
 # NVIDIA's nv-ppcie-verifier has strict version pins that conflict with vLLM
 echo "==> Installing attestation SDK in /opt/venv-attestation"

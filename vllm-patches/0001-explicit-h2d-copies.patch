@@ -1,0 +1,95 @@
+Confidential-computing guests cannot serve GPU reads of pinned host memory in place
+(no zero-copy UVA); with VLLM_UVA_ZERO_COPY=0 every host buffer becomes a device tensor
+filled by an explicit, stream-ordered copy, with pool slots guarded by CUDA events.
+
+--- a/v1/worker/gpu/buffer_utils.py
++++ b/v1/worker/gpu/buffer_utils.py
+@@ -3,6 +3,8 @@
+ from collections.abc import Iterable, Sequence
+ from functools import partial
+ 
++import os
++
+ import numpy as np
+ import torch
+ 
+@@ -17,7 +19,19 @@
+ # concurrent in-flight steps (engine batch_queue_size).
+ _DEFAULT_MAX_CONCURRENCY = 2
+ 
++# Zero-copy host buffers (UVA) let GPU kernels read pinned host memory in place.
++# Under NVIDIA confidential computing the GPU cannot access guest memory directly:
++# pinned allocations are serviced through encrypted UVM paging, so in-place reads
++# are neither cheap nor safe against the CPU rewriting a pool slot. With
++# VLLM_UVA_ZERO_COPY=0 every buffer is a device tensor filled by an explicit,
++# stream-ordered H2D copy, and pool slots are guarded by CUDA events.
++_ZERO_COPY = os.environ.get("VLLM_UVA_ZERO_COPY", "1") != "0"
+ 
++
++def uva_zero_copy_enabled() -> bool:
++    return _ZERO_COPY
++
++
+ def set_default_max_concurrency(n: int) -> None:
+     global _DEFAULT_MAX_CONCURRENCY
+     _DEFAULT_MAX_CONCURRENCY = max(2, n)
+@@ -47,9 +61,32 @@
+             raise RuntimeError("UVA is not available")
+         self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
+         self.np = self.cpu.numpy()
+-        self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
++        if _ZERO_COPY:
++            self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
++        else:
++            # Device copy of the pinned staging buffer; `uva` keeps the name so
++            # callers are unchanged. `copy_done` guards slot reuse: the CPU must
++            # not rewrite the pinned source while an H2D copy from it is pending.
++            self.uva = torch.zeros(
++                size, dtype=dtype, device=torch.cuda.current_device()
++            )
++            self.copy_done = torch.cuda.Event()
++            self.copy_pending = False
+ 
++    def sync_to_device(self, n: int) -> torch.Tensor:
++        """Explicit-copy mode: enqueue cpu[:n] -> device on the current stream."""
++        self.uva[:n].copy_(self.cpu[:n], non_blocking=True)
++        self.copy_done.record()
++        self.copy_pending = True
++        return self.uva[:n]
+ 
++    def wait_reusable(self) -> None:
++        """Explicit-copy mode: block until the last copy from this slot landed."""
++        if getattr(self, "copy_pending", False):
++            self.copy_done.synchronize()
++            self.copy_pending = False
++
++
+ class UvaBufferPool:
+     def __init__(
+         self,
+@@ -72,10 +109,14 @@
+         # Round robin to the next buffer.
+         self._curr = (self._curr + 1) % self.max_concurrency
+         buf = self._uva_bufs[self._curr]
++        if not _ZERO_COPY:
++            buf.wait_reusable()
+         # CPU-to-CPU copy
+         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
+         n = len(x)
+         dst[:n] = x
++        if not _ZERO_COPY:
++            return buf.sync_to_device(n)
+         return buf.uva[:n]
+ 
+     def copy_to_gpu(
+@@ -132,8 +173,8 @@
+         self.device = device
+         self.max_concurrency = max_concurrency
+ 
+-        if not uva_instead_of_gpu:
+-            # Create a GPU tensor (default)
++        if not uva_instead_of_gpu or not _ZERO_COPY:
++            # Create a GPU tensor (default; always when zero-copy is disabled)
+             self.gpu = torch.zeros(size, dtype=dtype, device=device)
+         else:
+             # For a large but not-frequently-accessed tensor, we can use UVA instead of

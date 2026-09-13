@@ -1,0 +1,90 @@
+The GDN attention-metadata builder selected rows of device tensors with host-side boolean
+masks, which uploads the mask's indices on the compute stream (blocking under CC); select
+with device index tensors uploaded like the rest of the metadata instead.
+
+--- a/v1/attention/backends/gdn_attn.py
++++ b/v1/attention/backends/gdn_attn.py
+@@ -264,6 +264,25 @@
+             query_lens = query_start_loc[1:] - query_start_loc[:-1]
+             assert spec_sequence_masks_cpu is not None
+             non_spec_sequence_masks_cpu = ~spec_sequence_masks_cpu
++            # Selecting rows of a device tensor with a host-side boolean mask uploads
++            # the mask's indices on the compute stream, which blocks the host under
++            # confidential computing; select with device index tensors uploaded like
++            # the rest of the metadata instead (nothing to upload when every
++            # sequence is speculative, the usual decode batch).
++            if bool(spec_sequence_masks_cpu.all()):
++                spec_rows: slice | torch.Tensor = slice(None)
++                non_spec_rows = torch.empty(
++                    0, dtype=torch.int64, device=query_start_loc.device
++                )
++            else:
++                spec_rows = async_tensor_h2d(
++                    spec_sequence_masks_cpu.nonzero(as_tuple=True)[0],
++                    device=query_start_loc.device,
++                )
++                non_spec_rows = async_tensor_h2d(
++                    non_spec_sequence_masks_cpu.nonzero(as_tuple=True)[0],
++                    device=query_start_loc.device,
++                )
+             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+ 
+             # Use CPU tensors to avoid CPU-GPU sync
+@@ -305,7 +324,7 @@
+                 )
+                 # Filter by spec_sequence_masks to exclude padded sequences
+                 spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                    spec_rows, : self.num_spec + 1
+                 ]
+                 non_spec_state_indices_tensor = None
+                 # Padded sequences are always at the back, so the first
+@@ -326,10 +345,10 @@
+                 spec_token_indx = index[num_non_spec_tokens:]
+ 
+                 spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                    spec_rows, : self.num_spec + 1
+                 ]
+                 non_spec_state_indices_tensor = block_table_tensor[
+-                    non_spec_sequence_masks_cpu, 0
++                    non_spec_rows, 0
+                 ]
+ 
+                 spec_query_start_loc = torch.zeros(
+@@ -338,7 +357,7 @@
+                     device=query_start_loc.device,
+                 )
+                 torch.cumsum(
+-                    query_lens[spec_sequence_masks_cpu],
++                    query_lens[spec_rows],
+                     dim=0,
+                     out=spec_query_start_loc[1:],
+                 )
+@@ -348,7 +367,7 @@
+                     device=query_start_loc.device,
+                 )
+                 torch.cumsum(
+-                    query_lens[non_spec_sequence_masks_cpu],
++                    query_lens[non_spec_rows],
+                     dim=0,
+                     out=non_spec_query_start_loc[1:],
+                 )
+@@ -363,7 +382,7 @@
+                 )
+ 
+             assert num_accepted_tokens is not None
+-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
++            num_accepted_tokens = num_accepted_tokens[spec_rows]
+ 
+         chunk_indices: torch.Tensor | None = None
+         chunk_offsets: torch.Tensor | None = None
+@@ -401,7 +420,7 @@
+             context_lens_tensor = m.compute_num_computed_tokens()
+             has_initial_state = context_lens_tensor > 0
+             if spec_sequence_masks_cpu is not None:
+-                has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
++                has_initial_state = has_initial_state[non_spec_rows]
+                 assert non_spec_query_start_loc_cpu is not None
+             nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                 compute_causal_conv1d_metadata(

@@ -1,0 +1,427 @@
+Multi-step decode for confidential computing: the token readback is deferred until the
+engine needs it (VLLM_CC_LAZY_READBACK), input copies go through a side stream with
+event-guarded pinned staging (VLLM_CC_H2D_STREAM, VLLM_PINNED_STAGING), and the engine
+keeps VLLM_CC_INFLIGHT_STEPS steps in flight so the host enqueue overlaps GPU work.
+
+--- a/config/vllm.py
++++ b/config/vllm.py
+@@ -562,6 +562,12 @@
+         pp_size = self.parallel_config.pipeline_parallel_size
+         if self.scheduler_config.async_scheduling:
+             if self.use_v2_model_runner:
++                # Confidential-computing prototype: run N steps ahead of the token
++                # readback so the host enqueue overlaps GPU work despite blocking copies.
++                import os
++                n = int(os.environ.get("VLLM_CC_INFLIGHT_STEPS", "0"))
++                if n >= 2:
++                    return max(n, pp_size + 1)
+                 return pp_size + 1
+             # V1 Model Runner does not fully support async scheduling with PP.
+             if pp_size <= 1:
+--- a/v1/worker/gpu/async_utils.py
++++ b/v1/worker/gpu/async_utils.py
+@@ -112,6 +112,29 @@
+             self._step = None
+ 
+ 
++# Under GPU confidential computing a device-to-host copy blocks the issuing thread until
++# the GPU has produced the data, so the "async" output drain stalls the main thread for a
++# whole step. VLLM_CC_THREAD_DRAIN=1 issues the drain from a dedicated worker thread (the
++# copy releases the GIL), letting the main thread schedule and prepare the next step.
++_THREAD_DRAIN = __import__("os").environ.get("VLLM_CC_THREAD_DRAIN", "0") == "1"
++# Lazy readback: under confidential computing a device-to-host copy blocks the issuing thread
++# until the GPU has produced the data. With several steps in flight the engine only needs a
++# step's tokens when it pops that step from the batch queue, so defer the copies to
++# get_output(); by then the step has long finished and the copy returns immediately. The
++# sampled ids / counts are cloned on the compute stream first so later steps can reuse the
++# sampler's buffers.
++_LAZY_READBACK = __import__("os").environ.get("VLLM_CC_LAZY_READBACK", "0") == "1"
++_drain_executor = None
++
++
++def _get_drain_executor():
++    global _drain_executor
++    if _drain_executor is None:
++        from concurrent.futures import ThreadPoolExecutor
++        _drain_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cc-drain")
++    return _drain_executor
++
++
+ class AsyncOutput(AsyncModelRunnerOutput):
+     def __init__(
+         self,
+@@ -133,10 +156,52 @@
+         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+         self.copy_event = torch.cuda.Event(blocking=True)
+         self._has_fault: torch.Tensor | None = None
++        self._drain = None
++        self._lazy = None
+ 
++        lazy_ok = _LAZY_READBACK and not check_ep_fault and routed_experts is None and (
++            sampler_output.logprobs_tensors is None
++            and sampler_output.sampling_mask_tensors is None
++            and not self.model_runner_output.prompt_logprobs_dict
++        )
++        if lazy_ok:
++            ids = sampler_output.sampled_token_ids.clone()
++            nst = num_sampled_tokens.clone()
++            nans = sampler_output.num_nans.clone() if sampler_output.num_nans is not None else None
++            ready = torch.cuda.Event()
++            ready.record(main_stream)
++            self._lazy = (ids, nst, nans, ready, copy_stream, main_stream)
++            self.logprobs_tensors = None
++            self.sampling_mask_tensors = None
++            self.routed_experts_cpu = None
++            self.prompt_logprobs_dict = {}
++            return
++
++        if _THREAD_DRAIN:
++            # Capture the main stream's position now; the worker must not wait for work
++            # the main thread enqueues for the next step after this point.
++            ready = torch.cuda.Event()
++            ready.record(main_stream)
++            device = main_stream.device
++
++            def _drain() -> None:
++                torch.cuda.set_device(device)
++                with stream(copy_stream, main_stream):
++                    copy_stream.wait_event(ready)
++                    self._issue_copies(sampler_output, num_sampled_tokens, routed_experts,
++                                       check_ep_fault, copy_stream)
++
++            self._drain = _get_drain_executor().submit(_drain)
++            return
++
+         with stream(copy_stream, main_stream):
+             copy_stream.wait_stream(main_stream)
++            self._issue_copies(sampler_output, num_sampled_tokens, routed_experts,
++                               check_ep_fault, copy_stream)
+ 
++    def _issue_copies(self, sampler_output, num_sampled_tokens, routed_experts,
++                      check_ep_fault, copy_stream) -> None:
++        if True:
+             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
+             self.logprobs_tensors: LogprobsTensors | None = None
+             if sampler_output.logprobs_tensors is not None:
+@@ -165,6 +230,19 @@
+             self.copy_event.record(copy_stream)
+ 
+     def get_output(self) -> ModelRunnerOutput:
++        if self._lazy is not None:
++            ids, nst, nans, ready, copy_stream, main_stream = self._lazy
++            self._lazy = None
++            # get_output() is called from the engine thread outside inference mode; the
++            # tensors involved were created inside it, so re-enter it for the copies.
++            with torch.inference_mode(), stream(copy_stream, main_stream):
++                copy_stream.wait_event(ready)
++                self.sampled_token_ids = async_copy_to_np(ids)
++                self.num_nans = async_copy_to_np(nans) if nans is not None else None
++                self.num_sampled_tokens_np = async_copy_to_np(nst)
++                self.copy_event.record(copy_stream)
++        if self._drain is not None:
++            self._drain.result()
+         self.copy_event.synchronize()
+ 
+         # NOTE(woosuk): The following code is to ensure compatibility with
+@@ -250,8 +328,27 @@
+         return self.model_runner_output
+ 
+ 
++_D2H_RING_DEPTH = 8
++_d2h_slots: dict[tuple, list[torch.Tensor]] = {}
++_d2h_next: dict[tuple, int] = {}
++_USE_D2H_RING = __import__("os").environ.get("VLLM_PINNED_STAGING", "0") == "1"
++
++
+ def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
+-    return x.to("cpu", non_blocking=True).numpy()
++    if not _USE_D2H_RING:
++        return x.to("cpu", non_blocking=True).numpy()
++    # Persistent pinned destination ring: a fresh pinned allocation per step pays the
++    # confidential-computing bounce-buffer setup toll; reuse of a slot happens
++    # _D2H_RING_DEPTH steps later, well after get_output() consumed it (batch queue <= 2).
++    key = (tuple(x.shape), x.dtype)
++    slots = _d2h_slots.setdefault(key, [])
++    if not slots:
++        slots.extend(torch.empty(x.shape, dtype=x.dtype, pin_memory=True) for _ in range(_D2H_RING_DEPTH))
++        _d2h_next[key] = 0
++    i = _d2h_next[key]; _d2h_next[key] = (i + 1) % _D2H_RING_DEPTH
++    dst = slots[i]
++    dst.copy_(x, non_blocking=True)
++    return dst.numpy()
+ 
+ 
+ @contextlib.contextmanager
+--- a/v1/worker/gpu/buffer_utils.py
++++ b/v1/worker/gpu/buffer_utils.py
+@@ -32,6 +32,166 @@
+     return _ZERO_COPY
+ 
+ 
++# Persistent pinned staging: under confidential computing every copy that touches a
++# freshly pinned host tensor pays a bounce-buffer setup toll (~ms), while copies from
++# a pinned buffer that already exists are cheap. VLLM_PINNED_STAGING=1 routes the
++# per-step host->device scalars/arrays through a small event-guarded ring of
++# persistent pinned buffers instead of x.pin_memory()/torch.tensor(pin_memory=True).
++_PINNED_STAGING = os.environ.get("VLLM_PINNED_STAGING", "0") == "1"
++
++# Under confidential computing a host->device copy blocks the CPU until every kernel queued
++# ahead of it on the same stream has finished, which serializes next-step input preparation
++# behind the current step. VLLM_CC_H2D_STREAM=1 issues staging copies on a dedicated stream
++# (which is idle, so the call returns immediately) and makes the compute stream wait on an
++# event before consuming. Only copies into per-slot / freshly allocated device buffers use
++# it; copies into persistent buffers that in-flight kernels may still read stay stream-ordered.
++_H2D_SIDE_STREAM = os.environ.get("VLLM_CC_H2D_STREAM", "0") == "1"
++_h2d_stream: torch.cuda.Stream | None = None
++
++
++def _side_stream() -> torch.cuda.Stream:
++    global _h2d_stream
++    if _h2d_stream is None:
++        _h2d_stream = torch.cuda.Stream()
++    return _h2d_stream
++
++
++# Persistent destination buffers (e.g. the CUDA-graph-captured query_start_loc) may still be
++# read by in-flight kernels, so they cannot be written from the side stream. Instead the host
++# data goes side-stream into a per-shape device ring slot, and a device-to-device copy on the
++# compute stream (stream-ordered, no host blocking) moves it into the persistent buffer.
++_dev_ring: dict[tuple, list[torch.Tensor]] = {}
++_dev_ring_next: dict[tuple, int] = {}
++_dev_ring_step: dict[tuple, list] = {}
++_DEV_RING_DEPTH = 8
++
++
++def persistent_h2d(dst: torch.Tensor, pinned_src: torch.Tensor) -> torch.Tensor:
++    key = (tuple(dst.shape), dst.dtype, dst.device.index)
++    slots = _dev_ring.setdefault(key, [])
++    if not slots:
++        slots.extend(torch.empty_like(dst) for _ in range(_DEV_RING_DEPTH))
++        _dev_ring_next[key] = 0
++        _dev_ring_step[key] = [None] * _DEV_RING_DEPTH
++    i = _dev_ring_next[key]; _dev_ring_next[key] = (i + 1) % _DEV_RING_DEPTH
++    slot = slots[i]
++    wait_step_consumed(_side_stream(), _dev_ring_step[key][i])
++    side_stream_copy(slot, pinned_src)          # host -> ring slot, side stream + event
++    _dev_ring_step[key][i] = current_step_id()
++    return dst.copy_(slot, non_blocking=True)   # ring slot -> persistent, compute stream (D2D)
++
++
++# Step bookkeeping for slot reuse when the CPU runs ahead of the GPU. Every staging slot
++# (pool slot or device ring slot) remembers the step in which it was last handed to
++# consumers; the step's end event is recorded on the compute stream by mark_step_end()
++# once all of that step's kernels are enqueued. Before a slot is rewritten on the side
++# stream, the side stream waits (on the GPU, no host block) for that step's end event.
++_step_id = [0]
++_step_end_events: dict[int, torch.cuda.Event] = {}
++
++
++def current_step_id() -> int:
++    return _step_id[0]
++
++
++def mark_step_end(stream: torch.cuda.Stream) -> None:
++    ev = torch.cuda.Event()
++    ev.record(stream)
++    sid = _step_id[0]
++    _step_end_events[sid] = ev
++    for old in [k for k in _step_end_events if k < sid - 16]:
++        del _step_end_events[old]
++    _step_id[0] = sid + 1
++
++
++def wait_step_consumed(stream: torch.cuda.Stream, sid: int | None) -> None:
++    """Make `stream` wait until the step that consumed a slot has fully executed."""
++    if sid is None:
++        return
++    ev = _step_end_events.get(sid)
++    if ev is not None:
++        stream.wait_event(ev)
++    elif sid >= _step_id[0]:
++        # The consuming step has not ended on the host yet (slot reused within a
++        # step or the pool is shallower than the in-flight depth): fall back to
++        # ordering behind everything currently on the compute stream.
++        stream.wait_stream(torch.cuda.current_stream())
++
++
++def side_stream_fresh(src: torch.Tensor, device: torch.device) -> torch.Tensor:
++    """Fresh device tensor = src (pinned host). Allocated on the side stream so the caching
++    allocator only reuses its block after the compute stream (recorded as a reader) is done
++    with it; allocating on the compute stream and writing from the side stream lets the
++    block be reused and rewritten while earlier compute-stream kernels still read it."""
++    main = torch.cuda.current_stream()
++    side = _side_stream()
++    with torch.cuda.stream(side):
++        out = torch.empty(src.shape, dtype=src.dtype, device=device)
++        out.copy_(src, non_blocking=True)
++        ev = torch.cuda.Event()
++        ev.record(side)
++    main.wait_event(ev)
++    out.record_stream(main)
++    return out
++
++
++def side_stream_copy(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
++    """dst.copy_(src) on the side stream; the caller's current stream waits for it."""
++    main = torch.cuda.current_stream()
++    side = _side_stream()
++    with torch.cuda.stream(side):
++        dst.copy_(src, non_blocking=True)
++        dst.record_stream(side)
++        ev = torch.cuda.Event()
++        ev.record(side)
++    main.wait_event(ev)
++    return dst
++
++
++class PinnedStagingRing:
++    """Ring of persistent pinned host buffers (one per dtype), grown on demand."""
++
++    def __init__(self, depth: int = 8, initial_numel: int = 1 << 16):
++        self.depth = depth
++        self.initial_numel = initial_numel
++        self._slots: dict[torch.dtype, list[tuple[torch.Tensor, torch.cuda.Event, bool]]] = {}
++        self._next: dict[torch.dtype, int] = {}
++
++    def stage(self, x: torch.Tensor) -> torch.Tensor:
++        """Copy CPU tensor `x` into a pinned slot; returns the pinned view (flat, same dtype)."""
++        dtype = x.dtype
++        slots = self._slots.setdefault(dtype, [])
++        if not slots:
++            for _ in range(self.depth):
++                slots.append((torch.empty(self.initial_numel, dtype=dtype, pin_memory=True), torch.cuda.Event(), False))
++            self._next[dtype] = 0
++        i = self._next[dtype]; self._next[dtype] = (i + 1) % self.depth
++        buf, ev, pending = slots[i]
++        if pending:
++            ev.synchronize()
++        n = x.numel()
++        if buf.numel() < n:
++            buf = torch.empty(max(n, 2 * buf.numel()), dtype=dtype, pin_memory=True)
++        view = buf[:n]
++        view.copy_(x.reshape(-1))
++        slots[i] = (buf, ev, True)
++        return view.view(x.shape), ev
++
++_staging_ring = PinnedStagingRing()
++
++
++def staged_h2d(x: torch.Tensor, out: torch.Tensor, side: bool = False) -> torch.Tensor:
++    """out.copy_(x) through the persistent pinned ring; records the slot's event."""
++    view, ev = _staging_ring.stage(x)
++    if side:
++        side_stream_copy(out, view)
++        ev.record(_side_stream())
++        return out
++    out.copy_(view, non_blocking=True)
++    ev.record()
++    return out
++
++
+ def set_default_max_concurrency(n: int) -> None:
+     global _DEFAULT_MAX_CONCURRENCY
+     _DEFAULT_MAX_CONCURRENCY = max(2, n)
+@@ -46,12 +206,31 @@
+         x = torch.from_numpy(x)
+     assert x.is_cpu
+ 
++    if out is None and _H2D_SIDE_STREAM:
++        assert device is not None
++        if _PINNED_STAGING and not x.is_pinned():
++            view, ev = _staging_ring.stage(x)
++            out = side_stream_fresh(view, torch.device(device))
++            ev.record(_side_stream())
++            return out
++        return side_stream_fresh(x.pin_memory(), torch.device(device))
+     if out is None:
+         assert device is not None
+         out = torch.empty_like(x, device=device)
+ 
++    if _PINNED_STAGING and not x.is_pinned():
++        if _H2D_SIDE_STREAM:
++            # Persistent destination: side stream into a guarded ring slot, then a
++            # stream-ordered device copy into `out` (no host blocking either way).
++            view, ev = _staging_ring.stage(x)
++            r = persistent_h2d(out, view)
++            ev.record(_side_stream())
++            return r
++        return staged_h2d(x, out, side=False)
+     # pin_memory() is no-op if the memory is already pinned.
+     pinned = x.pin_memory()
++    if _H2D_SIDE_STREAM:
++        return persistent_h2d(out, pinned)
+     return out.copy_(pinned, non_blocking=True)
+ 
+ 
+@@ -72,9 +251,17 @@
+             )
+             self.copy_done = torch.cuda.Event()
+             self.copy_pending = False
++            self.consumed_in_step: int | None = None
+ 
+     def sync_to_device(self, n: int) -> torch.Tensor:
+-        """Explicit-copy mode: enqueue cpu[:n] -> device on the current stream."""
++        """Explicit-copy mode: enqueue cpu[:n] -> device (side stream when enabled)."""
++        if _H2D_SIDE_STREAM:
++            wait_step_consumed(_side_stream(), getattr(self, "consumed_in_step", None))
++            side_stream_copy(self.uva[:n], self.cpu[:n])
++            self.copy_done.record(_side_stream())
++            self.copy_pending = True
++            self.consumed_in_step = current_step_id()
++            return self.uva[:n]
+         self.uva[:n].copy_(self.cpu[:n], non_blocking=True)
+         self.copy_done.record()
+         self.copy_pending = True
+@@ -222,9 +409,18 @@
+         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+ 
+         # Special handling for write_contents
+-        write_contents = async_tensor_h2d(
+-            self._staged_write_contents, device=self.device, dtype=self.dtype
+-        )
++        if _PINNED_STAGING and _H2D_SIDE_STREAM:
++            src = torch.tensor(self._staged_write_contents, dtype=self.dtype)
++            view, ev = _staging_ring.stage(src)
++            write_contents = side_stream_fresh(view, self.device)
++            ev.record(_side_stream())
++        elif _PINNED_STAGING:
++            src = torch.tensor(self._staged_write_contents, dtype=self.dtype)
++            write_contents = staged_h2d(src, torch.empty_like(src, device=self.device))
++        else:
++            write_contents = async_tensor_h2d(
++                self._staged_write_contents, device=self.device, dtype=self.dtype
++            )
+ 
+         # Write diffs to the GPU buffer
+         _apply_write_kernel[(n,)](
+@@ -295,7 +491,16 @@
+         indices_uva = self.indices.copy_to_uva(indices)
+         starts_uva = self.starts.copy_to_uva(starts)
+         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
+-        contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
++        if _PINNED_STAGING and _H2D_SIDE_STREAM:
++            src = torch.tensor(contents, dtype=torch.int32)
++            view, ev = _staging_ring.stage(src)
++            contents_gpu = side_stream_fresh(view, self.device)
++            ev.record(_side_stream())
++        elif _PINNED_STAGING:
++            src = torch.tensor(contents, dtype=torch.int32)
++            contents_gpu = staged_h2d(src, torch.empty_like(src, device=self.device))
++        else:
++            contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
+ 
+         _apply_write_kernel[(len(group_ids),)](
+             output_ptrs,
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -1971,6 +1971,10 @@
+         model_runner_output.kv_connector_output = kv_connector_output
+         model_runner_output.ec_connector_output = ec_connector_output
+ 
++        # Confidential-computing multi-step mode: every kernel of this step is enqueued now,
++        # so staging slots handed to it may be rewritten once the compute stream passes here.
++        from vllm.v1.worker.gpu.buffer_utils import mark_step_end
++        mark_step_end(self.main_stream)
+         return async_output
+ 
+     def take_draft_token_ids(self) -> DraftTokenIds | None:

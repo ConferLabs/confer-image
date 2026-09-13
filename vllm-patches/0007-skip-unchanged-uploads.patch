@@ -1,0 +1,30 @@
+Sampler state re-uploads whole arrays every step (free with zero-copy UVA, a real copy in
+explicit-copy mode); skip the upload while the array is unchanged since the last one.
+
+--- a/v1/worker/gpu/buffer_utils.py
++++ b/v1/worker/gpu/buffer_utils.py
+@@ -332,8 +332,24 @@
+         # Buffers for concurrency
+         self.pool = UvaBufferPool(size, dtype, max_concurrency)
+         self.gpu = self.pool.copy_to_uva(self.np)
++        # Explicit-copy mode: callers re-upload whole arrays every step because the
++        # zero-copy path makes that a host memcpy; here each upload is a real
++        # host-to-device copy, so skip it while the contents are unchanged. The
++        # device tensor only ever receives these uploads, and the pool slot holding
++        # it is not rotated until the next real upload.
++        self._uploaded = None if _ZERO_COPY else self.np.copy()
++        self._uploaded_valid = self._uploaded is not None
+ 
+     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
++        if self._uploaded is not None:
++            if n is not None:
++                # A partial upload leaves the device tensor as a slice of a pool slot.
++                self._uploaded_valid = False
++            elif self._uploaded_valid and np.array_equal(self.np, self._uploaded):
++                return self.gpu
++            else:
++                np.copyto(self._uploaded, self.np)
++                self._uploaded_valid = True
+         # CPU-to-CPU copy
+         self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
+         return self.gpu

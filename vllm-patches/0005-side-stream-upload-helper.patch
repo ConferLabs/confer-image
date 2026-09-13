@@ -1,0 +1,32 @@
+async_tensor_h2d (attention metadata builders, every step) uploads on the compute stream,
+which under CC blocks the CPU until the queued GPU work drains; route it through the
+side stream when VLLM_CC_H2D_STREAM=1.
+
+--- a/utils/torch_utils.py
++++ b/utils/torch_utils.py
+@@ -700,6 +700,9 @@
+             raise ValueError(f"Does not support value cache of type {cache_dtype}")
+         value_caches.append(value_cache)
+     return key_caches, value_caches
++
++
++_CC_H2D_STREAM = os.environ.get("VLLM_CC_H2D_STREAM", "0") == "1"
+ 
+ 
+ def async_tensor_h2d(
+@@ -715,6 +718,15 @@
+     else:
+         t = torch.tensor(data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu")
+     assert t.is_cpu
++    if _CC_H2D_STREAM and torch.device(device).type == "cuda":
++        # Under NVIDIA confidential computing a host-to-device copy on the compute
++        # stream blocks the CPU until the queued GPU work drains; issue it on the
++        # side stream instead so the runner can keep enqueuing ahead of the GPU.
++        from vllm.v1.worker.gpu.buffer_utils import side_stream_fresh
++
++        if dtype is not None and t.dtype != dtype:
++            t = t.to(dtype=dtype)
++        return side_stream_fresh(t, torch.device(device))
+     return t.to(device=device, dtype=dtype, non_blocking=True)
+ 
+ 

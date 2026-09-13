@@ -41,3 +41,24 @@ Output files:
 - `confer-image_<version>.initrd` - Initial ramdisk
 - `confer-image_<version>.qcow2` - Root filesystem
 - `confer-image_<version>.cmdline` - Kernel command line (includes dm-verity roothash)
+
+## Inference engine
+
+The image ships vLLM, started by `confer-vllm.service` with the configuration in
+`/mnt/config/secrets.env`. The launcher (`/usr/local/bin/confer-vllm`) accepts only the named
+variables listed at the top of that script and runs the engine under `env -i`; there is no
+argument pass-through, so an engine option that is not spelled out there cannot be enabled
+from the config disk.
+
+Speculative decoding is off unless `VLLM_MTP_TOKENS` is set.
+
+`vllm-patches/` holds unified diffs against the pinned vLLM release, applied at build time
+(`mkosi.postinst`) with no fuzz; `hashes.txt` lists every patched file with its stock and patched
+sha256, so a vLLM upgrade that touches one of them fails the build rather than silently dropping
+the change (`make check-vllm-patches` re-verifies the set against the wheel on PyPI). They exist
+because confidential-computing guests cannot serve GPU reads of pinned host memory in place and
+turn every host-device copy into a blocking call, which breaks and then serialises vLLM's V2
+model runner. `VLLM_CC_MULTISTEP=<steps>` in `secrets.env` enables the
+multi-step mode those overrides add: that many decode steps kept in flight with a deferred token
+readback that the tensor-parallel workers hold back until the engine needs it (0 disables it). FlashAttention 3 is the attention backend: the FlashInfer backend cannot use full CUDA graphs
+during speculative decoding.
