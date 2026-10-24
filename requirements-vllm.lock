@@ -12,7 +12,7 @@ attrs==26.1.0
 blake3==1.0.9
 cachetools==7.1.8
 cbor2==6.1.4
-certifi==2026.7.22
+certifi==2026.10.19
 cffi==2.1.1
 charset-normalizer==3.5.1
 click==8.5.0
@@ -125,7 +125,7 @@ opentelemetry-semantic-conventions-ai==0.5.1
 outlines_core==0.2.14
 packaging==26.3
 partial-json-parser==0.2.1.1.post7
-pillow==12.3.0
+pillow==13.0.0
 prometheus-fastapi-instrumentator==8.1.0
 prometheus_client==0.26.0
 propcache==0.5.2

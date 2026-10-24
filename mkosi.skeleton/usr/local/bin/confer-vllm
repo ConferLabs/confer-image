@@ -3,9 +3,11 @@
 #
 # Configuration is read only from the named variables below (EnvironmentFile in
 # confer-vllm.service). Every engine flag is spelled out here and vLLM runs under
-# env -i, so nothing else in the environment can reach it.
+# env -i, so nothing else in the environment can reach it. The listen address is
+# not configurable: vLLM serves without an API key and its only client is the proxy
+# in this guest, so it binds loopback.
 #
-#   VLLM_MODEL, VLLM_SERVED_MODEL_NAME, VLLM_HOST, VLLM_PORT
+#   VLLM_MODEL, VLLM_SERVED_MODEL_NAME, VLLM_PORT
 #   VLLM_GPU_MEMORY             fraction of GPU memory the engine may use
 #   VLLM_TENSOR_PARALLEL_SIZE, VLLM_MAX_MODEL_LEN, VLLM_MAX_NUM_SEQS
 #   VLLM_TOOL_CALL_PARSER, VLLM_REASONING_PARSER
@@ -37,7 +39,7 @@ case "${VLLM_CC_MULTISTEP:-0}" in 0|2) ;; *) echo "confer-vllm: VLLM_CC_MULTISTE
 args=(
   --model "$VLLM_MODEL"
   --served-model-name "$VLLM_SERVED_MODEL_NAME"
-  --host "$VLLM_HOST"
+  --host 127.0.0.1
   --port "$VLLM_PORT"
   --gpu-memory-utilization "$VLLM_GPU_MEMORY"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
