@@ -1,0 +1,6 @@
+[Unit]
+Description=Confer Image Normalizer Processes
+
+[Slice]
+MemoryMax=16G
+MemorySwapMax=0

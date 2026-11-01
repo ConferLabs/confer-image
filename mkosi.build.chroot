@@ -4,10 +4,40 @@
 #
 # NOTE: Changes made here do NOT persist to the final image!
 # Build scripts run in a temporary overlay for compiling/building.
-# For installing packages into the final image, use mkosi.postinst instead.
+# Only files installed under $DESTDIR are copied into the image.
+# Python packages are installed in mkosi.postinst (which persists to final image).
 
 set -euo pipefail
 
-echo "==> Build (chroot): No build steps needed"
-echo "    Python packages are installed in mkosi.postinst (which persists to final image)"
+# Image normalizer: a static binary, so its sandbox needs no libraries mounted. Cargo.lock pins
+# every crate by checksum; remapped paths and a single codegen unit keep the output identical
+# across builds.
+echo "==> Building confer-image-normalizer"
+RUST_TOOLCHAIN=/usr/lib/rust-1.91/bin
+[ -x "$RUST_TOOLCHAIN/cargo" ] || { echo "ERROR: cargo-1.91 is not installed (BuildPackages)"; exit 1; }
+
+# BuildSources=.:src in mkosi.conf mounts this repository at $SRCDIR/src.
+NORMALIZER_SRC="$SRCDIR/src/image-normalizer"
+NORMALIZER_BUILD="${BUILDDIR:-/var/tmp/confer-build}/image-normalizer"
+NORMALIZER_TARGET="$("$RUST_TOOLCHAIN/rustc" -vV | sed -n 's/^host: //p')"
+
+export PATH="$RUST_TOOLCHAIN:$PATH"
+export CARGO_HOME="$NORMALIZER_BUILD/cargo-home"
+export RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=$NORMALIZER_SRC=/src --remap-path-prefix=$CARGO_HOME=/cargo"
+
+cargo build \
+    --manifest-path "$NORMALIZER_SRC/Cargo.toml" \
+    --target-dir "$NORMALIZER_BUILD/target" \
+    --target "$NORMALIZER_TARGET" \
+    --locked \
+    --release
+
+NORMALIZER_BINARY="$NORMALIZER_BUILD/target/$NORMALIZER_TARGET/release/confer-image-normalizer"
+if readelf --dynamic "$NORMALIZER_BINARY" | grep -q '(NEEDED)'; then
+    echo "ERROR: confer-image-normalizer is dynamically linked"
+    exit 1
+fi
+install -D -m 0755 "$NORMALIZER_BINARY" "$DESTDIR/usr/lib/confer/confer-image-normalizer"
+echo "✓ confer-image-normalizer $(sha256sum "$NORMALIZER_BINARY" | cut -d' ' -f1)"
+
 echo "==> Build complete"

@@ -1,0 +1,17 @@
+[Unit]
+Description=Confer Image Normalizer Socket
+
+[Socket]
+ListenStream=/run/confer-image-normalizer/normalizer.sock
+Accept=yes
+Backlog=128
+# systemd always caps the connections it accepts (64 unless set) and refuses the rest. The proxy
+# keeps one per client websocket that is sending images, far fewer than this; what the processes
+# may use is bounded by the slice and each instance's own limits, not by this count.
+MaxConnections=1024
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

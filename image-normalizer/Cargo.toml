@@ -1,0 +1,18 @@
+[package]
+name = "confer-image-normalizer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.5.0"

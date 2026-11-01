@@ -52,6 +52,28 @@ from the config disk.
 
 Speculative decoding is off unless `VLLM_MTP_TOKENS` is set.
 
+## Image normalizer
+
+vLLM never decodes an uploaded image. `confer-image-normalizer` (`image-normalizer/`, Rust,
+JPEG/PNG/GIF/WebP decoders only) decodes them and writes width, height and 8-bit RGB. The proxy
+checks those dimensions and the exact length, writes the PPM header itself and serves the
+result to vLLM, so a compromised decoder can choose only pixel values. Images stream through:
+the proxy sends each image in chunks as it decrypts it and copies the pixels to vLLM as they
+arrive, holding neither in memory.
+
+`confer-image-normalizer.socket` starts one process per connection, as its own dynamic user,
+with no network, an empty root directory and a fixed set of system calls. The proxy keeps one
+connection for each client websocket and sends only that websocket's images on it, several at a
+time. Each image is decoded in a fresh child that never holds the connection and installs a
+narrower filter (read, write, memory, exit) before reading it; the parent relays bytes with
+splice(2) and never reads image data. So a decoder exploit reaches neither another user's images
+nor the same user's other images.
+
+The binary is built statically in `mkosi.build.chroot` with `cargo --locked`. Its tests include
+Linux-only checks of the child's filter and the connection protocol (`cargo test` on Linux).
+`image-normalizer/tests/compare_with_vllm.py` compares its pixels with vLLM's own image
+loading.
+
 `vllm-patches/` holds unified diffs against the pinned vLLM release, applied at build time
 (`mkosi.postinst`) with no fuzz; `hashes.txt` lists every patched file with its stock and patched
 sha256, so a vLLM upgrade that touches one of them fails the build rather than silently dropping

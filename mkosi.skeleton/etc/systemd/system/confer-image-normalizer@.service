@@ -1,0 +1,76 @@
+[Unit]
+Description=Confer Sandboxed Image Normalizer
+
+# Decodes untrusted images so image decoders never run inside vLLM, which sees every user's
+# requests. One process per proxy connection, and the proxy keeps one connection per client
+# websocket; each image is decoded in a fresh child that installs a narrower system call filter
+# first (see connection.rs). The process sees only its own connection: no network, no filesystem
+# beyond its own static binary, and a fixed set of system calls.
+[Service]
+Type=exec
+Slice=confer-image-normalizer.slice
+# A dynamic user per connection, so concurrent connections' processes never share a UID. Without
+# User=, every instance of this template would share one user named after the template.
+DynamicUser=yes
+User=cin-%i
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+ExecStart=/usr/lib/confer/confer-image-normalizer
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateIPC=yes
+PrivateMounts=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectHostname=yes
+ProtectProc=noaccess
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=none
+IPAddressDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@default @basic-io @signal madvise mremap poll ppoll
+# The parent's per-image work: fork a child, give it pipes, relay with splice (sizing messages
+# with FIONREAD), and wait for it or kill it at its deadline. The child itself (the filter in
+# child.rs) keeps only read, write, memory and exit.
+SystemCallFilter=clone wait4 kill pipe2 splice ioctl fcntl close_range prlimit64 setrlimit prctl seccomp
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# An empty root rather than TemporaryFileSystem=/: a mount over / does not change the root
+# of a process already inside it, so that leaves every file visible.
+RootDirectory=/run/confer-image-normalizer-root
+MountAPIVFS=no
+BindReadOnlyPaths=/usr/lib/confer/confer-image-normalizer
+NoExecPaths=/
+ExecPaths=/usr/lib/confer/confer-image-normalizer
+
+# The connection's images decode several at a time, each child capped at 4 GiB of address space
+# (the largest image vLLM accepts peaks near 2 GiB). Out of memory, the kernel kills the
+# largest child and only its image fails.
+MemoryMax=8G
+MemorySwapMax=0
+OOMPolicy=continue
+TasksMax=12
+LimitCORE=0
+LimitFSIZE=0
+LimitNOFILE=16
+# No CPUQuota= or CPUWeight=: enabling the CPU controller for each instance delays every start
+# by up to a quota period. Each child caps its own CPU time.

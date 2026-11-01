@@ -185,6 +185,7 @@ chroot /buildroot systemctl enable nvidia-cc-attestation.service
 chroot /buildroot systemctl enable confer-vllm.service
 chroot /buildroot systemctl enable confer-boot.service
 chroot /buildroot systemctl enable confer-proxy.service
+chroot /buildroot systemctl enable confer-image-normalizer.socket
 chroot /buildroot systemctl enable vector.service
 
 # Make scripts executable

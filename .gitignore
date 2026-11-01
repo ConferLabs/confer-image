@@ -21,3 +21,6 @@ doc/
 # Python test artifacts
 __pycache__/
 *.pyc
+
+# Rust build output
+image-normalizer/target/
