@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # vLLM launcher.
 #
 # Configuration is read only from the named variables below (EnvironmentFile in

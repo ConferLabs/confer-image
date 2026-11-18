@@ -10,7 +10,9 @@ Type=simple
 User=root
 WorkingDirectory=/run/confer
 EnvironmentFile=/mnt/config/secrets.env
+UnsetEnvironment=JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GLIBC_TUNABLES
 ExecStart=/usr/bin/java -Dfile.encoding=UTF-8 \
+    -XX:-UseBASE64Intrinsics \
     -Xms${JAVA_HEAP_MIN} \
     -Xmx${JAVA_HEAP_MAX} \
     -Djavax.net.ssl.trustStore=/run/java-cacerts/cacerts \

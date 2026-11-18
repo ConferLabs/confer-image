@@ -11,6 +11,7 @@ User=root
 RuntimeDirectory=vllm
 WorkingDirectory=/run/vllm
 EnvironmentFile=/mnt/config/secrets.env
+UnsetEnvironment=BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GLIBC_TUNABLES
 ExecStartPre=/bin/mkdir -p /tmp/huggingface /tmp/.cache
 ExecStart=/usr/local/bin/confer-vllm
 Restart=always
